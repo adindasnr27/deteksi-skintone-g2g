@@ -8,7 +8,7 @@ import matplotlib.patches as mpatches
 import seaborn as sns
 import os
 import io
-import dlib
+import mediapipe as mp
 
 # ─────────────────────────────────────────
 # KONFIGURASI HALAMAN
@@ -208,6 +208,19 @@ G2G_RECOMMENDATION = {
 }
 
 # ─────────────────────────────────────────
+# INITIALIZE MEDIAPIPE
+# ─────────────────────────────────────────
+@st.cache_resource
+def init_face_mesh():
+    """Initialize MediaPipe Face Mesh."""
+    mp_face_mesh = mp.solutions.face_mesh
+    return mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        min_detection_confidence=0.5,
+    )
+
+# ─────────────────────────────────────────
 # HELPER: Load model
 # ─────────────────────────────────────────
 @st.cache_resource
@@ -217,85 +230,73 @@ def load_model():
     return tf.keras.models.load_model(MODEL_PATH)
 
 # ─────────────────────────────────────────
-# HELPER: Face Landmark Detection dengan dlib
+# HELPER: Face Landmark Detection dengan MediaPipe
 # ─────────────────────────────────────────
-@st.cache_resource
-def load_face_detector():
-    """Load dlib face detector and predictor."""
-    try:
-        detector = dlib.get_frontal_face_detector()
-        # Download shape_predictor_68_face_landmarks.dat dari dlib
-        predictor_path = "shape_predictor_68_face_landmarks.dat"
-        if not os.path.exists(predictor_path):
-            # Fallback ke Haar Cascade jika dlib predictor tidak ada
-            return None, None
-        predictor = dlib.shape_predictor(predictor_path)
-        return detector, predictor
-    except:
-        return None, None
-
 def get_face_skin_mask(pil_img: Image.Image):
     """
-    Deteksi 68 titik wajah dan buat mask area kulit wajah (dahi, pipi, dagu).
-    Returns: (skin_mask, landmarks, face_roi)
+    Deteksi 468 titik wajah menggunakan MediaPipe dan buat mask area kulit wajah.
+    Returns: (skin_mask, face_roi, landmarks_visible)
     """
     # Konversi ke OpenCV
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    rgb_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
     h, w = cv_img.shape[:2]
     
     # Inisialisasi mask
     skin_mask = np.zeros((h, w), dtype=np.uint8)
-    landmarks = None
+    face_roi = None
+    landmarks_visible = False
     
-    # Coba dengan dlib
-    detector, predictor = load_face_detector()
-    
-    if detector is not None and predictor is not None:
-        faces = detector(gray, 0)
+    try:
+        face_mesh = init_face_mesh()
+        results = face_mesh.process(rgb_img)
         
-        if len(faces) > 0:
-            # Ambil wajah terbesar
-            face = max(faces, key=lambda r: r.width() * r.height())
-            landmarks = predictor(gray, face)
+        if results.multi_face_landmarks:
+            landmarks_visible = True
+            face_landmarks = results.multi_face_landmarks[0]
             
-            # Konversi landmarks ke numpy array
-            points = np.array([[p.x, p.y] for p in landmarks.parts()])
+            # Ambil koordinat landmark
+            landmarks = []
+            for landmark in face_landmarks.landmark:
+                x = int(landmark.x * w)
+                y = int(landmark.y * h)
+                landmarks.append((x, y))
             
-            # 1. Area dahi (titik 17-26 = alis)
-            forehead_points = points[17:27]
+            landmarks = np.array(landmarks)
             
-            # 2. Area pipi kiri (titik 2-15 = pipi kiri)
-            left_cheek_points = points[2:16]
+            # Area kulit wajah yang penting:
+            # - Dahi: indeks 10, 108, 67, 109, 10 (area atas)
+            # - Pipi kiri: indeks 234, 227, 116, 117, 118, 119, 120, 121
+            # - Pipi kanan: indeks 454, 447, 346, 347, 348, 349, 350, 351
+            # - Dagu: indeks 152, 148, 176, 149, 150, 136, 172
             
-            # 3. Area pipi kanan (titik 2-15 = pipi kanan) - diambil dari sisi kanan
-            right_cheek_points = points[1:17]
+            skin_indices = [
+                # Dahi (atas)
+                10, 108, 67, 109, 10,
+                # Pipi kiri
+                234, 227, 116, 117, 118, 119, 120, 121,
+                # Pipi kanan
+                454, 447, 346, 347, 348, 349, 350, 351,
+                # Dagu
+                152, 148, 176, 149, 150, 136, 172
+            ]
             
-            # 4. Area dagu (titik 6-11 = dagu)
-            chin_points = points[6:12]
-            
-            # Combine all skin area points
-            skin_points = np.concatenate([
-                forehead_points,
-                left_cheek_points,
-                right_cheek_points,
-                chin_points
-            ])
+            # Ambil titik-titik kulit
+            skin_points = landmarks[skin_indices]
             
             # Buat convex hull untuk area kulit
-            hull = cv2.convexHull(skin_points)
+            hull = cv2.convexHull(skin_points.astype(np.int32))
             cv2.fillConvexPoly(skin_mask, hull, 255)
             
-            # Buat ROI untuk area wajah yang lebih presisi
-            # Ambil bounding box dari landmarks
-            x_min = min(points[:, 0])
-            x_max = max(points[:, 0])
-            y_min = min(points[:, 1])
-            y_max = max(points[:, 1])
+            # Buat ROI dari semua landmark
+            x_min = min(landmarks[:, 0])
+            x_max = max(landmarks[:, 0])
+            y_min = min(landmarks[:, 1])
+            y_max = max(landmarks[:, 1])
             
-            # Tambahkan margin 10%
-            margin_x = int((x_max - x_min) * 0.1)
-            margin_y = int((y_max - y_min) * 0.1)
+            # Tambahkan margin 15%
+            margin_x = int((x_max - x_min) * 0.15)
+            margin_y = int((y_max - y_min) * 0.15)
             
             x1 = max(0, x_min - margin_x)
             y1 = max(0, y_min - margin_y)
@@ -304,10 +305,14 @@ def get_face_skin_mask(pil_img: Image.Image):
             
             face_roi = (x1, y1, x2, y2)
             
-            return skin_mask, landmarks, face_roi
+            return skin_mask, face_roi, landmarks_visible, landmarks
+            
+    except Exception as e:
+        st.warning(f"⚠️ MediaPipe error: {e}. Menggunakan deteksi wajah dasar.")
     
-    # Fallback: Haar Cascade dengan crop sederhana
+    # Fallback: Haar Cascade
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
     
     if len(faces) > 0:
@@ -320,26 +325,26 @@ def get_face_skin_mask(pil_img: Image.Image):
         margin = int(min(w, h) * 0.1)
         x1 = max(0, x - margin)
         y1 = max(0, y - margin)
-        x2 = min(w, x + w + margin)
-        y2 = min(h, y + h + margin)
+        x2 = min(cv_img.shape[1], x + w + margin)
+        y2 = min(cv_img.shape[0], y + h + margin)
         
         # Buat mask sederhana (area wajah)
         skin_mask[y1:y2, x1:x2] = 255
         face_roi = (x1, y1, x2, y2)
         
-        return skin_mask, None, face_roi
+        return skin_mask, face_roi, False, None
     
-    return None, None, None
+    return None, None, False, None
 
 def extract_skin_region(pil_img: Image.Image):
     """
     Ekstrak hanya area kulit wajah (dahi, pipi, dagu) dari gambar.
-    Returns: (skin_region, mask, landmarks)
+    Returns: (skin_region, mask, landmarks, landmarks_visible)
     """
-    skin_mask, landmarks, face_roi = get_face_skin_mask(pil_img)
+    skin_mask, face_roi, landmarks_visible, landmarks = get_face_skin_mask(pil_img)
     
     if skin_mask is None or face_roi is None:
-        return None, None, None
+        return None, None, None, False
     
     # Konversi PIL ke OpenCV
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
@@ -354,7 +359,7 @@ def extract_skin_region(pil_img: Image.Image):
     # Konversi kembali ke PIL
     skin_region = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
     
-    return skin_region, skin_mask, landmarks
+    return skin_region, skin_mask, landmarks, landmarks_visible
 
 def draw_landmarks(pil_img: Image.Image, landmarks):
     """Gambar titik-titik landmark di atas gambar."""
@@ -363,19 +368,19 @@ def draw_landmarks(pil_img: Image.Image, landmarks):
     
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     
-    # Gambar titik-titik landmark
-    for i, p in enumerate(landmarks.parts()):
-        cv2.circle(cv_img, (p.x, p.y), 2, (233, 30, 99), -1)
+    # Gambar titik-titik landmark (warna pink)
+    for i, (x, y) in enumerate(landmarks):
+        cv2.circle(cv_img, (x, y), 2, (233, 30, 99), -1)
     
-    # Gambar area wajah (convex hull)
-    points = np.array([[p.x, p.y] for p in landmarks.parts()])
-    skin_points = np.concatenate([
-        points[17:27],  # dahi
-        points[2:16],   # pipi kiri
-        points[1:17],   # pipi kanan
-        points[6:12]    # dagu
-    ])
-    hull = cv2.convexHull(skin_points)
+    # Gambar area kulit (convex hull)
+    skin_indices = [
+        10, 108, 67, 109, 10,  # dahi
+        234, 227, 116, 117, 118, 119, 120, 121,  # pipi kiri
+        454, 447, 346, 347, 348, 349, 350, 351,  # pipi kanan
+        152, 148, 176, 149, 150, 136, 172  # dagu
+    ]
+    skin_points = landmarks[skin_indices]
+    hull = cv2.convexHull(skin_points.astype(np.int32))
     cv2.polylines(cv_img, [hull], True, (0, 200, 100), 2)
     
     return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
@@ -431,7 +436,7 @@ if "prediction" not in st.session_state:
     st.session_state.probabilities = None
     st.session_state.uploaded_img = None
     st.session_state.skin_region = None
-    st.session_state.landmarks_detected = False
+    st.session_state.landmarks_visible = False
     st.session_state.face_detected = False
 
 model = load_model()
@@ -460,9 +465,9 @@ if page == "Upload Image":
             
             # Ekstrak area kulit wajah
             with st.spinner("🔍 Mendeteksi titik-titik wajah (dahi, pipi, dagu)..."):
-                skin_region, skin_mask, landmarks = extract_skin_region(pil_img)
+                skin_region, skin_mask, landmarks, landmarks_visible = extract_skin_region(pil_img)
                 st.session_state.skin_region = skin_region
-                st.session_state.landmarks_detected = landmarks is not None
+                st.session_state.landmarks_visible = landmarks_visible
                 st.session_state.face_detected = skin_region is not None
             
             col_img, col_info = st.columns([1, 1], gap="large")
@@ -471,8 +476,8 @@ if page == "Upload Image":
                 st.markdown("#### 📸 Foto Asli")
                 st.image(pil_img, use_container_width=True)
                 
-                if landmarks is not None:
-                    st.markdown("#### 🎯 Deteksi Titik Wajah")
+                if landmarks_visible and landmarks is not None:
+                    st.markdown("#### 🎯 Deteksi Titik Wajah (468 titik)")
                     landmark_img = draw_landmarks(pil_img, landmarks)
                     st.image(landmark_img, use_container_width=True)
                     st.caption("✅ Area dahi, pipi, dan dagu terdeteksi")
@@ -502,18 +507,18 @@ if page == "Upload Image":
                     
                     st.markdown("#### ✨ Validasi Foto")
                     
-                    if st.session_state.landmarks_detected:
+                    if landmarks_visible:
                         st.markdown(f"""
                         <div class="validation-pass">
-                            <strong>✅ 68 titik wajah terdeteksi</strong><br>
+                            <strong>✅ 468 titik wajah terdeteksi (MediaPipe)</strong><br>
                             <strong>✅ Dahi, pipi, dan dagu teridentifikasi</strong>
                         </div>
                         """, unsafe_allow_html=True)
                     else:
                         st.markdown(f"""
                         <div class="validation-warn">
-                            <strong>⚠️ Menggunakan deteksi wajah dasar</strong><br>
-                            Untuk hasil terbaik, install dlib dengan shape_predictor_68_face_landmarks.dat
+                            <strong>⚠️ Menggunakan deteksi wajah dasar (Haar Cascade)</strong><br>
+                            Untuk hasil terbaik, pastikan MediaPipe terinstall dengan baik.
                         </div>
                         """, unsafe_allow_html=True)
                     
@@ -574,9 +579,9 @@ if page == "Upload Image":
             st.session_state.uploaded_img = pil_img
             
             with st.spinner("🔍 Mendeteksi titik-titik wajah..."):
-                skin_region, skin_mask, landmarks = extract_skin_region(pil_img)
+                skin_region, skin_mask, landmarks, landmarks_visible = extract_skin_region(pil_img)
                 st.session_state.skin_region = skin_region
-                st.session_state.landmarks_detected = landmarks is not None
+                st.session_state.landmarks_visible = landmarks_visible
                 st.session_state.face_detected = skin_region is not None
             
             col_cam, col_cam_info = st.columns([1, 1], gap="large")
@@ -585,7 +590,7 @@ if page == "Upload Image":
                 st.markdown("#### 📸 Hasil Foto")
                 st.image(pil_img, use_container_width=True)
                 
-                if landmarks is not None:
+                if landmarks_visible and landmarks is not None:
                     st.markdown("#### 🎯 Deteksi Titik Wajah")
                     landmark_img = draw_landmarks(pil_img, landmarks)
                     st.image(landmark_img, use_container_width=True)
@@ -614,10 +619,10 @@ if page == "Upload Image":
                     
                     st.markdown("#### ✨ Validasi Foto")
                     
-                    if st.session_state.landmarks_detected:
+                    if landmarks_visible:
                         st.markdown(f"""
                         <div class="validation-pass">
-                            <strong>✅ 68 titik wajah terdeteksi</strong><br>
+                            <strong>✅ 468 titik wajah terdeteksi</strong><br>
                             <strong>✅ Dahi, pipi, dan dagu teridentifikasi</strong>
                         </div>
                         """, unsafe_allow_html=True)
@@ -794,7 +799,4 @@ elif page == "Beauty Recommendation":
                 <div style="width:52px;height:52px;border-radius:50%;background:{color};
                             margin:0 auto 6px;border:2px solid #F0A0B8;
                             box-shadow:0 2px 8px rgba(0,0,0,0.12);"></div>
-                <p style="font-size:0.7rem;font-weight:600;color:#C2185B;margin:0;">{code}</p>
-                <p style="font-size:0.72rem;color:#7D4455;margin:0;">{name}</p>
-            </div>
-            """, unsafe_allow_html=True)
+                <p
