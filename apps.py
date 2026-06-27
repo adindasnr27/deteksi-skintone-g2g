@@ -8,6 +8,7 @@ import matplotlib.patches as mpatches
 import seaborn as sns
 import os
 import io
+import dlib
 
 # ─────────────────────────────────────────
 # KONFIGURASI HALAMAN
@@ -169,6 +170,15 @@ hr { border-color: var(--pink-blush); }
     margin: 12px 0;
     text-align: center;
 }
+
+/* Landmark visualization */
+.landmark-container {
+    background: white;
+    border: 2px solid var(--pink-blush);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin: 12px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -207,44 +217,168 @@ def load_model():
     return tf.keras.models.load_model(MODEL_PATH)
 
 # ─────────────────────────────────────────
-# HELPER: Deteksi dan Crop Wajah
+# HELPER: Face Landmark Detection dengan dlib
 # ─────────────────────────────────────────
-def detect_and_crop_face(pil_img: Image.Image):
+@st.cache_resource
+def load_face_detector():
+    """Load dlib face detector and predictor."""
+    try:
+        detector = dlib.get_frontal_face_detector()
+        # Download shape_predictor_68_face_landmarks.dat dari dlib
+        predictor_path = "shape_predictor_68_face_landmarks.dat"
+        if not os.path.exists(predictor_path):
+            # Fallback ke Haar Cascade jika dlib predictor tidak ada
+            return None, None
+        predictor = dlib.shape_predictor(predictor_path)
+        return detector, predictor
+    except:
+        return None, None
+
+def get_face_skin_mask(pil_img: Image.Image):
     """
-    Deteksi wajah menggunakan Haar Cascade dan crop area wajah.
-    Returns: (cropped_face, face_box, is_face_detected)
+    Deteksi 68 titik wajah dan buat mask area kulit wajah (dahi, pipi, dagu).
+    Returns: (skin_mask, landmarks, face_roi)
     """
-    # Konversi ke OpenCV format
+    # Konversi ke OpenCV
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    h, w = cv_img.shape[:2]
     
-    # Deteksi wajah
+    # Inisialisasi mask
+    skin_mask = np.zeros((h, w), dtype=np.uint8)
+    landmarks = None
+    
+    # Coba dengan dlib
+    detector, predictor = load_face_detector()
+    
+    if detector is not None and predictor is not None:
+        faces = detector(gray, 0)
+        
+        if len(faces) > 0:
+            # Ambil wajah terbesar
+            face = max(faces, key=lambda r: r.width() * r.height())
+            landmarks = predictor(gray, face)
+            
+            # Konversi landmarks ke numpy array
+            points = np.array([[p.x, p.y] for p in landmarks.parts()])
+            
+            # 1. Area dahi (titik 17-26 = alis)
+            forehead_points = points[17:27]
+            
+            # 2. Area pipi kiri (titik 2-15 = pipi kiri)
+            left_cheek_points = points[2:16]
+            
+            # 3. Area pipi kanan (titik 2-15 = pipi kanan) - diambil dari sisi kanan
+            right_cheek_points = points[1:17]
+            
+            # 4. Area dagu (titik 6-11 = dagu)
+            chin_points = points[6:12]
+            
+            # Combine all skin area points
+            skin_points = np.concatenate([
+                forehead_points,
+                left_cheek_points,
+                right_cheek_points,
+                chin_points
+            ])
+            
+            # Buat convex hull untuk area kulit
+            hull = cv2.convexHull(skin_points)
+            cv2.fillConvexPoly(skin_mask, hull, 255)
+            
+            # Buat ROI untuk area wajah yang lebih presisi
+            # Ambil bounding box dari landmarks
+            x_min = min(points[:, 0])
+            x_max = max(points[:, 0])
+            y_min = min(points[:, 1])
+            y_max = max(points[:, 1])
+            
+            # Tambahkan margin 10%
+            margin_x = int((x_max - x_min) * 0.1)
+            margin_y = int((y_max - y_min) * 0.1)
+            
+            x1 = max(0, x_min - margin_x)
+            y1 = max(0, y_min - margin_y)
+            x2 = min(w, x_max + margin_x)
+            y2 = min(h, y_max + margin_y)
+            
+            face_roi = (x1, y1, x2, y2)
+            
+            return skin_mask, landmarks, face_roi
+    
+    # Fallback: Haar Cascade dengan crop sederhana
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
     
-    if len(faces) == 0:
-        return None, None, False
-    
-    # Ambil wajah terbesar (asumsi wajah utama)
-    if len(faces) > 1:
-        # Pilih wajah dengan area terbesar
+    if len(faces) > 0:
+        # Ambil wajah terbesar
         areas = [w * h for (x, y, w, h) in faces]
         largest_idx = np.argmax(areas)
         x, y, w, h = faces[largest_idx]
-    else:
-        x, y, w, h = faces[0]
+        
+        # Crop area wajah dengan margin
+        margin = int(min(w, h) * 0.1)
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(w, x + w + margin)
+        y2 = min(h, y + h + margin)
+        
+        # Buat mask sederhana (area wajah)
+        skin_mask[y1:y2, x1:x2] = 255
+        face_roi = (x1, y1, x2, y2)
+        
+        return skin_mask, None, face_roi
     
-    # Crop area wajah dengan margin 10%
-    margin = int(min(w, h) * 0.1)
-    x1 = max(0, x - margin)
-    y1 = max(0, y - margin)
-    x2 = min(cv_img.shape[1], x + w + margin)
-    y2 = min(cv_img.shape[0], y + h + margin)
+    return None, None, None
+
+def extract_skin_region(pil_img: Image.Image):
+    """
+    Ekstrak hanya area kulit wajah (dahi, pipi, dagu) dari gambar.
+    Returns: (skin_region, mask, landmarks)
+    """
+    skin_mask, landmarks, face_roi = get_face_skin_mask(pil_img)
     
-    face_crop = cv_img[y1:y2, x1:x2]
-    face_pil = Image.fromarray(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
+    if skin_mask is None or face_roi is None:
+        return None, None, None
     
-    return face_pil, (x1, y1, x2, y2), True
+    # Konversi PIL ke OpenCV
+    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    
+    # Aplikasikan mask ke gambar
+    masked_img = cv2.bitwise_and(cv_img, cv_img, mask=skin_mask)
+    
+    # Crop ke area wajah
+    x1, y1, x2, y2 = face_roi
+    cropped = masked_img[y1:y2, x1:x2]
+    
+    # Konversi kembali ke PIL
+    skin_region = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+    
+    return skin_region, skin_mask, landmarks
+
+def draw_landmarks(pil_img: Image.Image, landmarks):
+    """Gambar titik-titik landmark di atas gambar."""
+    if landmarks is None:
+        return pil_img
+    
+    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    
+    # Gambar titik-titik landmark
+    for i, p in enumerate(landmarks.parts()):
+        cv2.circle(cv_img, (p.x, p.y), 2, (233, 30, 99), -1)
+    
+    # Gambar area wajah (convex hull)
+    points = np.array([[p.x, p.y] for p in landmarks.parts()])
+    skin_points = np.concatenate([
+        points[17:27],  # dahi
+        points[2:16],   # pipi kiri
+        points[1:17],   # pipi kanan
+        points[6:12]    # dagu
+    ])
+    hull = cv2.convexHull(skin_points)
+    cv2.polylines(cv_img, [hull], True, (0, 200, 100), 2)
+    
+    return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
 
 # ─────────────────────────────────────────
 # HELPER: Preprocessing gambar
@@ -255,15 +389,13 @@ def preprocess_image(pil_img: Image.Image) -> np.ndarray:
     return np.expand_dims(arr, axis=0)
 
 # ─────────────────────────────────────────
-# HELPER: Cek kualitas gambar (hanya untuk wajah)
+# HELPER: Cek kualitas gambar
 # ─────────────────────────────────────────
-def check_face_quality(pil_img: Image.Image):
-    """Cek kualitas gambar wajah yang sudah di-crop."""
+def check_image_quality(pil_img: Image.Image):
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     brightness = float(gray.mean())
 
-    # Cek pencahayaan
     if brightness < 80:
         light_status, light_msg = "warn", f"Terlalu gelap (brightness {brightness:.0f})"
     elif brightness > 200:
@@ -274,7 +406,6 @@ def check_face_quality(pil_img: Image.Image):
     return {
         "light_status": light_status,
         "light_msg": light_msg,
-        "face_detected": True
     }
 
 # ─────────────────────────────────────────
@@ -299,7 +430,8 @@ if "prediction" not in st.session_state:
     st.session_state.prediction = None
     st.session_state.probabilities = None
     st.session_state.uploaded_img = None
-    st.session_state.cropped_face = None
+    st.session_state.skin_region = None
+    st.session_state.landmarks_detected = False
     st.session_state.face_detected = False
 
 model = load_model()
@@ -310,7 +442,7 @@ model = load_model()
 if page == "Upload Image":
     st.markdown("# Temukan Shade-mu")
     st.markdown("Upload foto wajah atau ambil foto langsung menggunakan kamera.")
-    st.info("💡 **Tips:** Pastikan wajah terlihat jelas dan pencahayaan cukup untuk hasil terbaik.")
+    st.info("💡 **Tips:** Pastikan wajah terlihat jelas, pencahayaan cukup, dan tidak ada aksesoris yang menutupi wajah.")
 
     if model is None:
         st.error("Model belum ditemukan. Pastikan `skin_tone_model.h5` ada di repo.")
@@ -326,11 +458,12 @@ if page == "Upload Image":
             pil_img = Image.open(uploaded)
             st.session_state.uploaded_img = pil_img
             
-            # Deteksi dan crop wajah
-            with st.spinner("🔍 Mendeteksi wajah..."):
-                cropped_face, face_box, face_detected = detect_and_crop_face(pil_img)
-                st.session_state.cropped_face = cropped_face
-                st.session_state.face_detected = face_detected
+            # Ekstrak area kulit wajah
+            with st.spinner("🔍 Mendeteksi titik-titik wajah (dahi, pipi, dagu)..."):
+                skin_region, skin_mask, landmarks = extract_skin_region(pil_img)
+                st.session_state.skin_region = skin_region
+                st.session_state.landmarks_detected = landmarks is not None
+                st.session_state.face_detected = skin_region is not None
             
             col_img, col_info = st.columns([1, 1], gap="large")
 
@@ -338,42 +471,61 @@ if page == "Upload Image":
                 st.markdown("#### 📸 Foto Asli")
                 st.image(pil_img, use_container_width=True)
                 
-                if face_detected and face_box:
-                    st.markdown("#### 👤 Wajah Terdeteksi")
-                    st.image(cropped_face, use_container_width=True)
-                    st.caption("✅ Area wajah berhasil di-crop untuk analisis")
+                if landmarks is not None:
+                    st.markdown("#### 🎯 Deteksi Titik Wajah")
+                    landmark_img = draw_landmarks(pil_img, landmarks)
+                    st.image(landmark_img, use_container_width=True)
+                    st.caption("✅ Area dahi, pipi, dan dagu terdeteksi")
+                
+                if skin_region is not None:
+                    st.markdown("#### 🎨 Area Kulit yang Dianalisis")
+                    st.image(skin_region, use_container_width=True)
+                    st.caption("✅ Hanya area kulit wajah yang diproses (bukan background/kerudung)")
 
             with col_info:
-                if not face_detected:
+                if not st.session_state.face_detected:
                     st.markdown(f"""
                     <div class="validation-fail">
                         <strong>⚠️ Wajah tidak terdeteksi</strong><br>
-                        Mohon upload foto dengan wajah yang jelas dan terlihat.
+                        Mohon upload foto dengan wajah yang jelas.
                         <br><br>
                         <strong>Tips:</strong><br>
                         • Gunakan foto close-up<br>
                         • Pastikan wajah menghadap kamera<br>
-                        • Hindari foto dengan banyak orang
+                        • Hindari aksesoris yang menutupi wajah<br>
+                        • Pastikan pencahayaan cukup
                     </div>
                     """, unsafe_allow_html=True)
                 else:
-                    # Cek kualitas wajah yang sudah di-crop
-                    quality = check_face_quality(cropped_face)
+                    quality = check_image_quality(skin_region)
                     is_valid = (quality["light_status"] == "ok")
                     
                     st.markdown("#### ✨ Validasi Foto")
                     
+                    if st.session_state.landmarks_detected:
+                        st.markdown(f"""
+                        <div class="validation-pass">
+                            <strong>✅ 68 titik wajah terdeteksi</strong><br>
+                            <strong>✅ Dahi, pipi, dan dagu teridentifikasi</strong>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div class="validation-warn">
+                            <strong>⚠️ Menggunakan deteksi wajah dasar</strong><br>
+                            Untuk hasil terbaik, install dlib dengan shape_predictor_68_face_landmarks.dat
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
                     if is_valid:
                         st.markdown(f"""
                         <div class="validation-pass">
-                            <strong>✅ Wajah terdeteksi</strong><br>
                             <strong>✅</strong> {quality["light_msg"]}
                         </div>
                         """, unsafe_allow_html=True)
                     else:
                         st.markdown(f"""
                         <div class="validation-fail">
-                            <strong>✅ Wajah terdeteksi</strong><br>
                             <strong>⚠️</strong> {quality["light_msg"]}
                             <br><br>
                             <strong>Tips:</strong><br>
@@ -384,12 +536,10 @@ if page == "Upload Image":
 
                     st.markdown("---")
 
-                    # Prediksi hanya jika wajah terdeteksi
-                    if is_valid:
+                    if is_valid and skin_region is not None:
                         st.markdown("#### 💄 Analisis Skin Tone")
                         with st.spinner("🔄 Menganalisis kulit wajah kamu..."):
-                            # Gunakan cropped face untuk prediksi
-                            tensor = preprocess_image(cropped_face)
+                            tensor = preprocess_image(skin_region)
                             probs = model.predict(tensor, verbose=0)[0]
                             idx = int(np.argmax(probs))
                             label = CLASS_NAMES[idx]
@@ -410,7 +560,7 @@ if page == "Upload Image":
 
                         st.success("💖 Lihat **Beauty Recommendation** di sidebar untuk saran shade G2G kamu!")
                     else:
-                        st.warning("⚠️ Pencahayaan kurang baik. Silakan upload foto dengan pencahayaan yang lebih baik.")
+                        st.warning("⚠️ Kualitas gambar kurang baik. Silakan upload foto dengan pencahayaan yang lebih baik.")
 
     # ── TAB 2: Camera ──
     with tab2:
@@ -423,11 +573,11 @@ if page == "Upload Image":
             pil_img = Image.open(camera_image)
             st.session_state.uploaded_img = pil_img
             
-            # Deteksi dan crop wajah
-            with st.spinner("🔍 Mendeteksi wajah..."):
-                cropped_face, face_box, face_detected = detect_and_crop_face(pil_img)
-                st.session_state.cropped_face = cropped_face
-                st.session_state.face_detected = face_detected
+            with st.spinner("🔍 Mendeteksi titik-titik wajah..."):
+                skin_region, skin_mask, landmarks = extract_skin_region(pil_img)
+                st.session_state.skin_region = skin_region
+                st.session_state.landmarks_detected = landmarks is not None
+                st.session_state.face_detected = skin_region is not None
             
             col_cam, col_cam_info = st.columns([1, 1], gap="large")
 
@@ -435,13 +585,17 @@ if page == "Upload Image":
                 st.markdown("#### 📸 Hasil Foto")
                 st.image(pil_img, use_container_width=True)
                 
-                if face_detected and face_box:
-                    st.markdown("#### 👤 Wajah Terdeteksi")
-                    st.image(cropped_face, use_container_width=True)
-                    st.caption("✅ Area wajah berhasil di-crop untuk analisis")
+                if landmarks is not None:
+                    st.markdown("#### 🎯 Deteksi Titik Wajah")
+                    landmark_img = draw_landmarks(pil_img, landmarks)
+                    st.image(landmark_img, use_container_width=True)
+                
+                if skin_region is not None:
+                    st.markdown("#### 🎨 Area Kulit yang Dianalisis")
+                    st.image(skin_region, use_container_width=True)
 
             with col_cam_info:
-                if not face_detected:
+                if not st.session_state.face_detected:
                     st.markdown(f"""
                     <div class="validation-fail">
                         <strong>⚠️ Wajah tidak terdeteksi</strong><br>
@@ -450,19 +604,27 @@ if page == "Upload Image":
                         <strong>Tips:</strong><br>
                         • Posisikan wajah di tengah frame<br>
                         • Pastikan wajah menghadap kamera<br>
-                        • Ambil foto dari jarak dekat
+                        • Ambil foto dari jarak dekat<br>
+                        • Pastikan pencahayaan cukup
                     </div>
                     """, unsafe_allow_html=True)
                 else:
-                    quality = check_face_quality(cropped_face)
+                    quality = check_image_quality(skin_region)
                     is_valid = (quality["light_status"] == "ok")
                     
                     st.markdown("#### ✨ Validasi Foto")
                     
+                    if st.session_state.landmarks_detected:
+                        st.markdown(f"""
+                        <div class="validation-pass">
+                            <strong>✅ 68 titik wajah terdeteksi</strong><br>
+                            <strong>✅ Dahi, pipi, dan dagu teridentifikasi</strong>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
                     if is_valid:
                         st.markdown(f"""
                         <div class="validation-pass">
-                            <strong>✅ Wajah terdeteksi</strong><br>
                             <strong>✅</strong> {quality["light_msg"]}
                             <br><br>
                             <strong style="color:#2E7D32;">🎉 Foto valid! Memproses prediksi...</strong>
@@ -471,7 +633,6 @@ if page == "Upload Image":
                     else:
                         st.markdown(f"""
                         <div class="validation-fail">
-                            <strong>✅ Wajah terdeteksi</strong><br>
                             <strong>⚠️</strong> {quality["light_msg"]}
                             <br><br>
                             <strong>Tips:</strong><br>
@@ -482,10 +643,10 @@ if page == "Upload Image":
 
                     st.markdown("---")
 
-                    if is_valid:
+                    if is_valid and skin_region is not None:
                         st.markdown("#### 💄 Analisis Skin Tone")
                         with st.spinner("🔄 Menganalisis kulit wajah kamu..."):
-                            tensor = preprocess_image(cropped_face)
+                            tensor = preprocess_image(skin_region)
                             probs = model.predict(tensor, verbose=0)[0]
                             idx = int(np.argmax(probs))
                             label = CLASS_NAMES[idx]
@@ -506,7 +667,7 @@ if page == "Upload Image":
 
                         st.success("💖 Lihat **Beauty Recommendation** di sidebar untuk saran shade G2G kamu!")
                     else:
-                        st.warning("⚠️ Pencahayaan kurang baik. Silakan ambil foto dengan pencahayaan yang lebih baik.")
+                        st.warning("⚠️ Kualitas gambar kurang baik. Silakan ambil foto dengan pencahayaan yang lebih baik.")
         else:
             st.info("📸 Klik tombol kamera di atas untuk mengambil foto.")
 
@@ -576,15 +737,15 @@ elif page == "Beauty Recommendation":
     pred = st.session_state.prediction
     rec = G2G_RECOMMENDATION[pred]
     img = st.session_state.uploaded_img
-    cropped = st.session_state.cropped_face
+    skin = st.session_state.skin_region
 
     col_photo, col_rec = st.columns([1, 1.4], gap="large")
 
     with col_photo:
-        if cropped and st.session_state.face_detected:
-            st.markdown("#### 👤 Wajah yang Dianalisis")
-            st.image(cropped, use_container_width=True)
-            st.caption("Area wajah yang digunakan untuk prediksi")
+        if skin and st.session_state.face_detected:
+            st.markdown("#### 🎨 Area Kulit yang Dianalisis")
+            st.image(skin, use_container_width=True)
+            st.caption("Area dahi, pipi, dan dagu yang digunakan untuk prediksi")
         elif img:
             st.image(img, caption="Foto kamu", use_container_width=True)
 
