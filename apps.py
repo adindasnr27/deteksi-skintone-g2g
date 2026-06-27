@@ -159,17 +159,26 @@ hr { border-color: var(--pink-blush); }
     border-radius: 8px;
     margin: 8px 0;
 }
+
+/* Face crop result */
+.face-crop-container {
+    background: white;
+    border: 2px solid var(--pink-blush);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin: 12px 0;
+    text-align: center;
+}
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────
 # KONSTANTA
 # ─────────────────────────────────────────
-CLASS_NAMES = ["dark", "fair", "light"]          # sesuaikan urutan folder dataset
+CLASS_NAMES = ["dark", "fair", "light"]
 IMG_SIZE    = (224, 224)
 MODEL_PATH  = "skin_tone_model.h5"
 
-# G2G shade mapping per kelas skin tone
 G2G_RECOMMENDATION = {
     "fair": {
         "shades":   "00 Allegato / 01 Buttercream",
@@ -189,31 +198,69 @@ G2G_RECOMMENDATION = {
 }
 
 # ─────────────────────────────────────────
-# HELPER: Load model (cache agar tidak reload tiap interaksi)
+# HELPER: Load model
 # ─────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    """Load model .h5 dari repo."""
     if not os.path.exists(MODEL_PATH):
         return None
     return tf.keras.models.load_model(MODEL_PATH)
 
 # ─────────────────────────────────────────
+# HELPER: Deteksi dan Crop Wajah
+# ─────────────────────────────────────────
+def detect_and_crop_face(pil_img: Image.Image):
+    """
+    Deteksi wajah menggunakan Haar Cascade dan crop area wajah.
+    Returns: (cropped_face, face_box, is_face_detected)
+    """
+    # Konversi ke OpenCV format
+    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    
+    # Deteksi wajah
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+    
+    if len(faces) == 0:
+        return None, None, False
+    
+    # Ambil wajah terbesar (asumsi wajah utama)
+    if len(faces) > 1:
+        # Pilih wajah dengan area terbesar
+        areas = [w * h for (x, y, w, h) in faces]
+        largest_idx = np.argmax(areas)
+        x, y, w, h = faces[largest_idx]
+    else:
+        x, y, w, h = faces[0]
+    
+    # Crop area wajah dengan margin 10%
+    margin = int(min(w, h) * 0.1)
+    x1 = max(0, x - margin)
+    y1 = max(0, y - margin)
+    x2 = min(cv_img.shape[1], x + w + margin)
+    y2 = min(cv_img.shape[0], y + h + margin)
+    
+    face_crop = cv_img[y1:y2, x1:x2]
+    face_pil = Image.fromarray(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
+    
+    return face_pil, (x1, y1, x2, y2), True
+
+# ─────────────────────────────────────────
 # HELPER: Preprocessing gambar
 # ─────────────────────────────────────────
 def preprocess_image(pil_img: Image.Image) -> np.ndarray:
-    """Resize, normalize, expand dims → siap masuk model."""
     img = pil_img.convert("RGB").resize(IMG_SIZE)
-    arr = np.array(img, dtype=np.float32) / 255.0   # normalisasi [0,1]
-    return np.expand_dims(arr, axis=0)               # (1, 224, 224, 3)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    return np.expand_dims(arr, axis=0)
 
 # ─────────────────────────────────────────
-# HELPER: Cek kualitas gambar
+# HELPER: Cek kualitas gambar (hanya untuk wajah)
 # ─────────────────────────────────────────
-def check_image_quality(pil_img: Image.Image):
-    """Return dict dengan status pencahayaan & deteksi wajah."""
+def check_face_quality(pil_img: Image.Image):
+    """Cek kualitas gambar wajah yang sudah di-crop."""
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    gray   = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     brightness = float(gray.mean())
 
     # Cek pencahayaan
@@ -224,27 +271,11 @@ def check_image_quality(pil_img: Image.Image):
     else:
         light_status, light_msg = "ok", f"Pencahayaan baik (brightness {brightness:.0f})"
 
-    # Deteksi wajah dengan Haar Cascade
-    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    faces   = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-    if len(faces) > 0:
-        face_status, face_msg = "ok",   "Wajah terdeteksi"
-    else:
-        face_status, face_msg = "warn", "Wajah tidak terdeteksi – coba foto lebih dekat"
-
     return {
-        "light_status": light_status, "light_msg": light_msg,
-        "face_status":  face_status,  "face_msg":  face_msg,
+        "light_status": light_status,
+        "light_msg": light_msg,
+        "face_detected": True
     }
-
-# ─────────────────────────────────────────
-# HELPER: Validasi gambar untuk proses
-# ─────────────────────────────────────────
-def validate_image_for_processing(pil_img: Image.Image):
-    """Validasi apakah gambar layak diproses."""
-    quality = check_image_quality(pil_img)
-    is_valid = (quality["light_status"] == "ok" and quality["face_status"] == "ok")
-    return is_valid, quality
 
 # ─────────────────────────────────────────
 # SIDEBAR NAVIGASI
@@ -265,11 +296,11 @@ with st.sidebar:
 # SESSION STATE
 # ─────────────────────────────────────────
 if "prediction" not in st.session_state:
-    st.session_state.prediction    = None   # label string
-    st.session_state.probabilities = None   # array float
-    st.session_state.uploaded_img  = None   # PIL Image
-    st.session_state.camera_image  = None   # PIL Image from camera
-    st.session_state.auto_process  = False  # Flag untuk auto-process setelah validasi
+    st.session_state.prediction = None
+    st.session_state.probabilities = None
+    st.session_state.uploaded_img = None
+    st.session_state.cropped_face = None
+    st.session_state.face_detected = False
 
 model = load_model()
 
@@ -279,13 +310,13 @@ model = load_model()
 if page == "Upload Image":
     st.markdown("# Temukan Shade-mu")
     st.markdown("Upload foto wajah atau ambil foto langsung menggunakan kamera.")
+    st.info("💡 **Tips:** Pastikan wajah terlihat jelas dan pencahayaan cukup untuk hasil terbaik.")
 
     if model is None:
         st.error("Model belum ditemukan. Pastikan `skin_tone_model.h5` ada di repo.")
         st.stop()
 
-    # ── Tab untuk upload dan camera ──
-    tab1, tab2 = st.tabs(["Upload Foto", "Ambil Foto"])
+    tab1, tab2 = st.tabs(["📤 Upload Foto", "📷 Ambil Foto"])
 
     # ── TAB 1: Upload ──
     with tab1:
@@ -294,139 +325,190 @@ if page == "Upload Image":
         if uploaded:
             pil_img = Image.open(uploaded)
             st.session_state.uploaded_img = pil_img
-            st.session_state.camera_image = None
+            
+            # Deteksi dan crop wajah
+            with st.spinner("🔍 Mendeteksi wajah..."):
+                cropped_face, face_box, face_detected = detect_and_crop_face(pil_img)
+                st.session_state.cropped_face = cropped_face
+                st.session_state.face_detected = face_detected
             
             col_img, col_info = st.columns([1, 1], gap="large")
 
             with col_img:
-                st.markdown("#### Preview")
+                st.markdown("#### 📸 Foto Asli")
                 st.image(pil_img, use_container_width=True)
+                
+                if face_detected and face_box:
+                    st.markdown("#### 👤 Wajah Terdeteksi")
+                    st.image(cropped_face, use_container_width=True)
+                    st.caption("✅ Area wajah berhasil di-crop untuk analisis")
 
             with col_info:
-                # Cek kualitas gambar
-                st.markdown("#### Cek Kualitas Foto")
-                quality = check_image_quality(pil_img)
-                
-                is_valid = (quality["light_status"] == "ok" and quality["face_status"] == "ok")
-                
-                if is_valid:
-                    st.markdown(f"""
-                    <div class="validation-pass">
-                        <strong>✓</strong> {quality["light_msg"]}<br>
-                        <strong>✓</strong> {quality["face_msg"]}
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
+                if not face_detected:
                     st.markdown(f"""
                     <div class="validation-fail">
-                        <strong>⚠</strong> {quality["light_msg"] if quality["light_status"] == "warn" else quality["face_msg"] if quality["face_status"] == "warn" else "Perbaiki kualitas foto"}
+                        <strong>⚠️ Wajah tidak terdeteksi</strong><br>
+                        Mohon upload foto dengan wajah yang jelas dan terlihat.
+                        <br><br>
+                        <strong>Tips:</strong><br>
+                        • Gunakan foto close-up<br>
+                        • Pastikan wajah menghadap kamera<br>
+                        • Hindari foto dengan banyak orang
                     </div>
                     """, unsafe_allow_html=True)
-
-                st.markdown("---")
-
-                # Prediksi otomatis jika valid
-                if is_valid:
-                    st.markdown("#### Prediksi Skin Tone")
-                    with st.spinner("Menganalisis kulit kamu..."):
-                        tensor = preprocess_image(pil_img)
-                        probs  = model.predict(tensor, verbose=0)[0]
-                        idx    = int(np.argmax(probs))
-                        label  = CLASS_NAMES[idx]
-                        conf   = float(probs[idx]) * 100
-
-                    st.session_state.prediction    = label
-                    st.session_state.probabilities = probs
-
-                    st.markdown(f"""
-                    <div class="result-card">
-                        <h2>{label.title()}</h2>
-                        <p style="font-size:0.95rem;color:#7D4455;">Skin Tone yang terdeteksi</p>
-                        <hr style="border-color:#F0A0B8;margin:12px 0;">
-                        <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{conf:.1f}%</p>
-                        <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    st.info("Lihat **Beauty Recommendation** di sidebar untuk saran shade G2G kamu!")
                 else:
-                    st.warning("Foto belum memenuhi kriteria. Pastikan pencahayaan cukup dan wajah terdeteksi dengan jelas.")
+                    # Cek kualitas wajah yang sudah di-crop
+                    quality = check_face_quality(cropped_face)
+                    is_valid = (quality["light_status"] == "ok")
+                    
+                    st.markdown("#### ✨ Validasi Foto")
+                    
+                    if is_valid:
+                        st.markdown(f"""
+                        <div class="validation-pass">
+                            <strong>✅ Wajah terdeteksi</strong><br>
+                            <strong>✅</strong> {quality["light_msg"]}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div class="validation-fail">
+                            <strong>✅ Wajah terdeteksi</strong><br>
+                            <strong>⚠️</strong> {quality["light_msg"]}
+                            <br><br>
+                            <strong>Tips:</strong><br>
+                            • Cari pencahayaan yang lebih baik<br>
+                            • Hindari bayangan di wajah
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.markdown("---")
+
+                    # Prediksi hanya jika wajah terdeteksi
+                    if is_valid:
+                        st.markdown("#### 💄 Analisis Skin Tone")
+                        with st.spinner("🔄 Menganalisis kulit wajah kamu..."):
+                            # Gunakan cropped face untuk prediksi
+                            tensor = preprocess_image(cropped_face)
+                            probs = model.predict(tensor, verbose=0)[0]
+                            idx = int(np.argmax(probs))
+                            label = CLASS_NAMES[idx]
+                            conf = float(probs[idx]) * 100
+
+                        st.session_state.prediction = label
+                        st.session_state.probabilities = probs
+
+                        st.markdown(f"""
+                        <div class="result-card">
+                            <h2>✨ {label.title()}</h2>
+                            <p style="font-size:0.95rem;color:#7D4455;">Skin Tone yang terdeteksi</p>
+                            <hr style="border-color:#F0A0B8;margin:12px 0;">
+                            <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{conf:.1f}%</p>
+                            <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        st.success("💖 Lihat **Beauty Recommendation** di sidebar untuk saran shade G2G kamu!")
+                    else:
+                        st.warning("⚠️ Pencahayaan kurang baik. Silakan upload foto dengan pencahayaan yang lebih baik.")
 
     # ── TAB 2: Camera ──
     with tab2:
-        st.markdown("#### Ambil Foto dengan Kamera")
-        st.caption("Pastikan pencahayaan cukup dan wajah terlihat jelas.")
+        st.markdown("#### 📷 Ambil Foto dengan Kamera")
+        st.caption("Pastikan wajah terlihat jelas dan pencahayaan cukup.")
         
-        # Camera input
-        camera_image = st.camera_input("Ambil foto", label_visibility="collapsed")
+        camera_image = st.camera_input("📸 Ambil foto", label_visibility="collapsed")
         
         if camera_image is not None:
             pil_img = Image.open(camera_image)
-            st.session_state.camera_image = pil_img
             st.session_state.uploaded_img = pil_img
+            
+            # Deteksi dan crop wajah
+            with st.spinner("🔍 Mendeteksi wajah..."):
+                cropped_face, face_box, face_detected = detect_and_crop_face(pil_img)
+                st.session_state.cropped_face = cropped_face
+                st.session_state.face_detected = face_detected
             
             col_cam, col_cam_info = st.columns([1, 1], gap="large")
 
             with col_cam:
-                st.markdown("#### Hasil Foto")
+                st.markdown("#### 📸 Hasil Foto")
                 st.image(pil_img, use_container_width=True)
+                
+                if face_detected and face_box:
+                    st.markdown("#### 👤 Wajah Terdeteksi")
+                    st.image(cropped_face, use_container_width=True)
+                    st.caption("✅ Area wajah berhasil di-crop untuk analisis")
 
             with col_cam_info:
-                # Cek kualitas gambar
-                st.markdown("#### Validasi Foto")
-                quality = check_image_quality(pil_img)
-                
-                is_valid = (quality["light_status"] == "ok" and quality["face_status"] == "ok")
-                
-                if is_valid:
-                    st.markdown(f"""
-                    <div class="validation-pass">
-                        <strong>✓</strong> {quality["light_msg"]}<br>
-                        <strong>✓</strong> {quality["face_msg"]}<br>
-                        <br>
-                        <strong style="color:#2E7D32;">Foto valid! Memproses prediksi...</strong>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    # Auto-process jika valid
-                    st.markdown("---")
-                    st.markdown("#### Prediksi Skin Tone")
-                    with st.spinner("Menganalisis kulit kamu..."):
-                        tensor = preprocess_image(pil_img)
-                        probs  = model.predict(tensor, verbose=0)[0]
-                        idx    = int(np.argmax(probs))
-                        label  = CLASS_NAMES[idx]
-                        conf   = float(probs[idx]) * 100
-
-                    st.session_state.prediction    = label
-                    st.session_state.probabilities = probs
-
-                    st.markdown(f"""
-                    <div class="result-card">
-                        <h2>{label.title()}</h2>
-                        <p style="font-size:0.95rem;color:#7D4455;">Skin Tone yang terdeteksi</p>
-                        <hr style="border-color:#F0A0B8;margin:12px 0;">
-                        <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{conf:.1f}%</p>
-                        <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    st.info("Lihat **Beauty Recommendation** di sidebar untuk saran shade G2G kamu!")
-                else:
+                if not face_detected:
                     st.markdown(f"""
                     <div class="validation-fail">
-                        <strong>⚠ Foto belum memenuhi kriteria</strong><br>
-                        {quality["light_msg"] if quality["light_status"] == "warn" else ""}
-                        {quality["face_msg"] if quality["face_status"] == "warn" else ""}
+                        <strong>⚠️ Wajah tidak terdeteksi</strong><br>
+                        Mohon ambil foto dengan wajah yang jelas.
                         <br><br>
                         <strong>Tips:</strong><br>
-                        • Pastikan ruangan cukup terang<br>
                         • Posisikan wajah di tengah frame<br>
-                        • Hindari bayangan di wajah
+                        • Pastikan wajah menghadap kamera<br>
+                        • Ambil foto dari jarak dekat
                     </div>
                     """, unsafe_allow_html=True)
+                else:
+                    quality = check_face_quality(cropped_face)
+                    is_valid = (quality["light_status"] == "ok")
+                    
+                    st.markdown("#### ✨ Validasi Foto")
+                    
+                    if is_valid:
+                        st.markdown(f"""
+                        <div class="validation-pass">
+                            <strong>✅ Wajah terdeteksi</strong><br>
+                            <strong>✅</strong> {quality["light_msg"]}
+                            <br><br>
+                            <strong style="color:#2E7D32;">🎉 Foto valid! Memproses prediksi...</strong>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div class="validation-fail">
+                            <strong>✅ Wajah terdeteksi</strong><br>
+                            <strong>⚠️</strong> {quality["light_msg"]}
+                            <br><br>
+                            <strong>Tips:</strong><br>
+                            • Cari pencahayaan yang lebih baik<br>
+                            • Hindari bayangan di wajah
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.markdown("---")
+
+                    if is_valid:
+                        st.markdown("#### 💄 Analisis Skin Tone")
+                        with st.spinner("🔄 Menganalisis kulit wajah kamu..."):
+                            tensor = preprocess_image(cropped_face)
+                            probs = model.predict(tensor, verbose=0)[0]
+                            idx = int(np.argmax(probs))
+                            label = CLASS_NAMES[idx]
+                            conf = float(probs[idx]) * 100
+
+                        st.session_state.prediction = label
+                        st.session_state.probabilities = probs
+
+                        st.markdown(f"""
+                        <div class="result-card">
+                            <h2>✨ {label.title()}</h2>
+                            <p style="font-size:0.95rem;color:#7D4455;">Skin Tone yang terdeteksi</p>
+                            <hr style="border-color:#F0A0B8;margin:12px 0;">
+                            <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{conf:.1f}%</p>
+                            <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        st.success("💖 Lihat **Beauty Recommendation** di sidebar untuk saran shade G2G kamu!")
+                    else:
+                        st.warning("⚠️ Pencahayaan kurang baik. Silakan ambil foto dengan pencahayaan yang lebih baik.")
         else:
-            st.info("Klik tombol di atas untuk mengambil foto menggunakan kamera Anda.")
+            st.info("📸 Klik tombol kamera di atas untuk mengambil foto.")
 
 # ═══════════════════════════════════════════════════════════════
 # HALAMAN 2 – MODEL INSIGHT
@@ -439,19 +521,17 @@ elif page == "Model Insight":
         st.stop()
 
     probs = st.session_state.probabilities
-    pred  = st.session_state.prediction
+    pred = st.session_state.prediction
 
-    # Confidence score predicted class
     conf = float(probs[CLASS_NAMES.index(pred)]) * 100
     st.metric("Confidence Score", f"{conf:.1f}%", help="Probabilitas kelas yang diprediksi")
 
     st.markdown("---")
     st.markdown("#### Probabilitas Semua Kelas")
 
-    # Bar chart horizontal
     fig, ax = plt.subplots(figsize=(7, 3.5))
-    colors  = ["#E8638C" if c == pred else "#F9C6D0" for c in CLASS_NAMES]
-    h_bars  = ax.barh(
+    colors = ["#E8638C" if c == pred else "#F9C6D0" for c in CLASS_NAMES]
+    h_bars = ax.barh(
         [c.title() for c in CLASS_NAMES],
         [p * 100 for p in probs],
         color=colors, height=0.45, edgecolor="white",
@@ -494,20 +574,24 @@ elif page == "Beauty Recommendation":
         st.stop()
 
     pred = st.session_state.prediction
-    rec  = G2G_RECOMMENDATION[pred]
-    img  = st.session_state.uploaded_img
+    rec = G2G_RECOMMENDATION[pred]
+    img = st.session_state.uploaded_img
+    cropped = st.session_state.cropped_face
 
     col_photo, col_rec = st.columns([1, 1.4], gap="large")
 
     with col_photo:
-        if img:
+        if cropped and st.session_state.face_detected:
+            st.markdown("#### 👤 Wajah yang Dianalisis")
+            st.image(cropped, use_container_width=True)
+            st.caption("Area wajah yang digunakan untuk prediksi")
+        elif img:
             st.image(img, caption="Foto kamu", use_container_width=True)
 
     with col_rec:
         st.markdown(f"### Skin Tone: **{pred.title()}**")
         st.markdown("")
 
-        # Card: G2G Shade
         st.markdown(f"""
         <div class="rec-card">
             <p style="font-size:0.78rem;text-transform:uppercase;letter-spacing:1px;color:#7D4455;margin-bottom:4px;">G2G Foundation Shade</p>
@@ -515,7 +599,6 @@ elif page == "Beauty Recommendation":
         </div>
         """, unsafe_allow_html=True)
 
-        # Card: Skincare
         st.markdown(f"""
         <div class="rec-card">
             <p style="font-size:0.78rem;text-transform:uppercase;letter-spacing:1px;color:#7D4455;margin-bottom:4px;">Skincare Recommendation</p>
@@ -523,7 +606,6 @@ elif page == "Beauty Recommendation":
         </div>
         """, unsafe_allow_html=True)
 
-        # Tip
         st.markdown(f"""
         <div class="rec-card" style="border-left-color:#F9C6D0;">
             <p style="font-size:0.78rem;text-transform:uppercase;letter-spacing:1px;color:#7D4455;margin-bottom:4px;">Beauty Tip</p>
@@ -533,16 +615,15 @@ elif page == "Beauty Recommendation":
 
         st.caption("Rekomendasi berdasarkan prediksi AI. Lakukan swatching sebelum membeli.")
 
-    # G2G Shade Reference
     st.markdown("---")
     st.markdown("#### Semua Shade G2G")
     shades = [
-        ("00", "Allegato",    "#F5D5B0"),
+        ("00", "Allegato", "#F5D5B0"),
         ("01", "Buttercream", "#F2C89A"),
-        ("02", "Praline",     "#D4A278"),
-        ("03", "Cookies",     "#C49060"),
-        ("04", "Ginger",      "#B07848"),
-        ("05", "Cinnamon",    "#8B5E3C"),
+        ("02", "Praline", "#D4A278"),
+        ("03", "Cookies", "#C49060"),
+        ("04", "Ginger", "#B07848"),
+        ("05", "Cinnamon", "#8B5E3C"),
     ]
     cols = st.columns(6)
     for col, (code, name, color) in zip(cols, shades):
