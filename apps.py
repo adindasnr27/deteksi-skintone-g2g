@@ -6,7 +6,6 @@ import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import os
-import mediapipe as mp
 
 # ─────────────────────────────────────────
 # KONFIGURASI HALAMAN
@@ -54,14 +53,6 @@ p, li, label, div { font-family: 'DM Sans', sans-serif; color: var(--text-dark);
 }
 .stAlert { border-radius: var(--radius) !important; }
 hr { border-color: var(--pink-blush); }
-.badge-ok {
-    display:inline-block; background:#E8F5E9; color:#2E7D32;
-    border-radius:50px; padding:3px 12px; font-size:0.82rem; font-weight:500;
-}
-.badge-warn {
-    display:inline-block; background:#FFF3E0; color:#E65100;
-    border-radius:50px; padding:3px 12px; font-size:0.82rem; font-weight:500;
-}
 .result-card {
     background: linear-gradient(135deg, #FDE8EF, #fff);
     border: 1.5px solid var(--pink-blush); border-radius: var(--radius);
@@ -110,86 +101,6 @@ G2G_RECOMMENDATION = {
 }
 
 # ─────────────────────────────────────────
-# MEDIAPIPE FACE MESH
-# ─────────────────────────────────────────
-@st.cache_resource
-def init_face_mesh():
-    return mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        min_detection_confidence=0.5,
-    )
-
-def extract_skin_region(pil_img):
-    """Ekstrak area kulit wajah (dahi, pipi, dagu) dengan MediaPipe."""
-    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    rgb_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-    h, w = cv_img.shape[:2]
-    
-    try:
-        face_mesh = init_face_mesh()
-        results = face_mesh.process(rgb_img)
-        
-        if results.multi_face_landmarks:
-            landmarks = []
-            for lm in results.multi_face_landmarks[0].landmark:
-                landmarks.append((int(lm.x * w), int(lm.y * h)))
-            landmarks = np.array(landmarks)
-            
-            # Indeks area kulit: dahi, pipi kiri, pipi kanan, dagu
-            skin_indices = [10, 108, 67, 109, 10, 234, 227, 116, 117, 118, 119, 120, 121,
-                          454, 447, 346, 347, 348, 349, 350, 351, 152, 148, 176, 149, 150, 136, 172]
-            skin_points = landmarks[skin_indices]
-            
-            # Buat mask area kulit
-            skin_mask = np.zeros((h, w), dtype=np.uint8)
-            hull = cv2.convexHull(skin_points.astype(np.int32))
-            cv2.fillConvexPoly(skin_mask, hull, 255)
-            
-            # ROI
-            x_min, x_max = min(landmarks[:,0]), max(landmarks[:,0])
-            y_min, y_max = min(landmarks[:,1]), max(landmarks[:,1])
-            margin_x, margin_y = int((x_max-x_min)*0.15), int((y_max-y_min)*0.15)
-            x1, y1 = max(0,x_min-margin_x), max(0,y_min-margin_y)
-            x2, y2 = min(w,x_max+margin_x), min(h,y_max+margin_y)
-            
-            # Aplikasikan mask dan crop
-            masked = cv2.bitwise_and(cv_img, cv_img, mask=skin_mask)
-            cropped = masked[y1:y2, x1:x2]
-            return Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)), True, landmarks
-    except:
-        pass
-    
-    # Fallback: Haar Cascade
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50,50))
-    
-    if len(faces) > 0:
-        areas = [w*h for (x,y,w,h) in faces]
-        x, y, w, h = faces[np.argmax(areas)]
-        margin = int(min(w,h)*0.1)
-        x1, y1 = max(0,x-margin), max(0,y-margin)
-        x2, y2 = min(w,x+w+margin), min(h,y+h+margin)
-        cropped = cv_img[y1:y2, x1:x2]
-        return Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)), False, None
-    
-    return None, False, None
-
-def draw_landmarks(pil_img, landmarks):
-    """Gambar landmark di atas gambar."""
-    if landmarks is None:
-        return pil_img
-    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    for x, y in landmarks:
-        cv2.circle(cv_img, (x, y), 2, (233, 30, 99), -1)
-    skin_indices = [10, 108, 67, 109, 10, 234, 227, 116, 117, 118, 119, 120, 121,
-                   454, 447, 346, 347, 348, 349, 350, 351, 152, 148, 176, 149, 150, 136, 172]
-    hull = cv2.convexHull(landmarks[skin_indices].astype(np.int32))
-    cv2.polylines(cv_img, [hull], True, (0, 200, 100), 2)
-    return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
-
-# ─────────────────────────────────────────
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────
 @st.cache_resource
@@ -203,19 +114,108 @@ def preprocess_image(pil_img):
     arr = np.array(img, dtype=np.float32) / 255.0
     return np.expand_dims(arr, axis=0)
 
+def detect_face_skin(pil_img):
+    """
+    Deteksi wajah dan ekstrak area kulit (dahi, pipi, dagu) menggunakan Haar Cascade
+    dengan pendekatan yang lebih presisi.
+    """
+    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    h, w = cv_img.shape[:2]
+    
+    # Deteksi wajah dengan Haar Cascade
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+    
+    if len(faces) == 0:
+        return None, False
+    
+    # Ambil wajah terbesar
+    areas = [w * h for (x, y, w, h) in faces]
+    largest_idx = np.argmax(areas)
+    x, y, w, h = faces[largest_idx]
+    
+    # Buat mask untuk area wajah
+    mask = np.zeros((h, w), dtype=np.uint8)
+    
+    # Crop area wajah dengan margin
+    margin_x = int(w * 0.15)
+    margin_y = int(h * 0.15)
+    
+    # Koordinat crop dengan margin
+    x1 = max(0, x - margin_x)
+    y1 = max(0, y - margin_y)
+    x2 = min(cv_img.shape[1], x + w + margin_x)
+    y2 = min(cv_img.shape[0], y + h + margin_y)
+    
+    # Crop gambar
+    cropped = cv_img[y1:y2, x1:x2]
+    
+    # Konversi ke PIL
+    skin_region = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+    
+    # Deteksi area kulit lebih spesifik (dahi, pipi, dagu)
+    # Menggunakan segmentasi warna kulit sederhana dalam area wajah
+    h_crop, w_crop = cropped.shape[:2]
+    
+    # Konversi ke YCrCb untuk deteksi kulit
+    skin_crop = cv2.cvtColor(cropped, cv2.COLOR_BGR2YCrCb)
+    
+    # Range warna kulit dalam YCrCb
+    lower_skin = np.array([0, 133, 77], dtype=np.uint8)
+    upper_skin = np.array([255, 173, 127], dtype=np.uint8)
+    
+    # Mask kulit
+    skin_mask = cv2.inRange(skin_crop, lower_skin, upper_skin)
+    
+    # Gabungkan dengan mask wajah
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
+    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
+    
+    # Aplikasikan mask ke cropped
+    masked = cv2.bitwise_and(cropped, cropped, mask=skin_mask)
+    
+    # Jika hasil masking terlalu sedikit, gunakan crop biasa
+    if np.sum(skin_mask) < 1000:
+        return skin_region, True
+    
+    skin_region_masked = Image.fromarray(cv2.cvtColor(masked, cv2.COLOR_BGR2RGB))
+    return skin_region_masked, True
+
 def check_quality(pil_img):
+    """Cek kualitas gambar (pencahayaan)."""
     gray = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
     brightness = float(gray.mean())
+    
     if brightness < 80:
-        return "warn", f"Terlalu gelap ({brightness:.0f})"
+        return "warn", f"Terlalu gelap (brightness {brightness:.0f})"
     elif brightness > 200:
-        return "warn", f"Terlalu terang ({brightness:.0f})"
-    return "ok", f"Pencahayaan baik ({brightness:.0f})"
+        return "warn", f"Terlalu terang (brightness {brightness:.0f})"
+    return "ok", f"Pencahayaan baik (brightness {brightness:.0f})"
+
+def draw_face_detection(pil_img):
+    """Gambar bounding box wajah pada gambar."""
+    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+    
+    for (x, y, w, h) in faces:
+        cv2.rectangle(cv_img, (x, y), (x+w, y+h), (233, 30, 99), 3)
+        # Gambar area dahi, pipi, dagu
+        cv2.rectangle(cv_img, (x+int(w*0.2), y+int(h*0.1)), (x+int(w*0.8), y+int(h*0.3)), (0, 200, 100), 2)  # dahi
+        cv2.rectangle(cv_img, (x+int(w*0.05), y+int(h*0.3)), (x+int(w*0.35), y+int(h*0.7)), (0, 200, 100), 2)  # pipi kiri
+        cv2.rectangle(cv_img, (x+int(w*0.65), y+int(h*0.3)), (x+int(w*0.95), y+int(h*0.7)), (0, 200, 100), 2)  # pipi kanan
+        cv2.rectangle(cv_img, (x+int(w*0.25), y+int(h*0.7)), (x+int(w*0.75), y+int(h*0.9)), (0, 200, 100), 2)  # dagu
+    
+    return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
 
 # ─────────────────────────────────────────
 # SESSION STATE & SIDEBAR
 # ─────────────────────────────────────────
-for key in ["prediction", "probabilities", "uploaded_img", "skin_region", "landmarks", "face_detected"]:
+for key in ["prediction", "probabilities", "uploaded_img", "skin_region", "face_detected"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -249,18 +249,17 @@ if page == "Upload Image":
             pil_img = Image.open(uploaded)
             st.session_state.uploaded_img = pil_img
             
-            with st.spinner("🔍 Mendeteksi titik wajah..."):
-                skin_region, landmarks_detected, landmarks = extract_skin_region(pil_img)
+            with st.spinner("🔍 Mendeteksi wajah..."):
+                skin_region, face_detected = detect_face_skin(pil_img)
                 st.session_state.skin_region = skin_region
-                st.session_state.landmarks = landmarks
-                st.session_state.face_detected = skin_region is not None
+                st.session_state.face_detected = face_detected
             
             col_img, col_info = st.columns([1, 1], gap="large")
             
             with col_img:
                 st.image(pil_img, caption="Foto Asli", use_container_width=True)
-                if landmarks_detected and landmarks is not None:
-                    st.image(draw_landmarks(pil_img, landmarks), caption="Deteksi Titik Wajah", use_container_width=True)
+                if face_detected:
+                    st.image(draw_face_detection(pil_img), caption="Deteksi Wajah (Dahi, Pipi, Dagu)", use_container_width=True)
                 if skin_region is not None:
                     st.image(skin_region, caption="Area Kulit yang Dianalisis", use_container_width=True)
             
@@ -275,9 +274,6 @@ if page == "Upload Image":
                 else:
                     status, msg = check_quality(skin_region)
                     is_valid = (status == "ok")
-                    
-                    if landmarks_detected:
-                        st.markdown('<div class="validation-pass"><strong>✅ 468 titik wajah terdeteksi</strong></div>', unsafe_allow_html=True)
                     
                     st.markdown(f'<div class="validation-{"pass" if is_valid else "fail"}"><strong>{"✅" if is_valid else "⚠️"}</strong> {msg}</div>', unsafe_allow_html=True)
                     
@@ -310,18 +306,17 @@ if page == "Upload Image":
             pil_img = Image.open(camera_image)
             st.session_state.uploaded_img = pil_img
             
-            with st.spinner("🔍 Mendeteksi titik wajah..."):
-                skin_region, landmarks_detected, landmarks = extract_skin_region(pil_img)
+            with st.spinner("🔍 Mendeteksi wajah..."):
+                skin_region, face_detected = detect_face_skin(pil_img)
                 st.session_state.skin_region = skin_region
-                st.session_state.landmarks = landmarks
-                st.session_state.face_detected = skin_region is not None
+                st.session_state.face_detected = face_detected
             
             col_cam, col_cam_info = st.columns([1, 1], gap="large")
             
             with col_cam:
                 st.image(pil_img, caption="Hasil Foto", use_container_width=True)
-                if landmarks_detected and landmarks is not None:
-                    st.image(draw_landmarks(pil_img, landmarks), caption="Deteksi Titik Wajah", use_container_width=True)
+                if face_detected:
+                    st.image(draw_face_detection(pil_img), caption="Deteksi Wajah", use_container_width=True)
                 if skin_region is not None:
                     st.image(skin_region, caption="Area Kulit", use_container_width=True)
             
@@ -336,9 +331,6 @@ if page == "Upload Image":
                 else:
                     status, msg = check_quality(skin_region)
                     is_valid = (status == "ok")
-                    
-                    if landmarks_detected:
-                        st.markdown('<div class="validation-pass"><strong>✅ 468 titik wajah terdeteksi</strong></div>', unsafe_allow_html=True)
                     
                     st.markdown(f'<div class="validation-{"pass" if is_valid else "fail"}"><strong>{"✅" if is_valid else "⚠️"}</strong> {msg}</div>', unsafe_allow_html=True)
                     
