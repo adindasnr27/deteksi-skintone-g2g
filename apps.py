@@ -72,6 +72,10 @@ hr { border-color: var(--pink-blush); }
     background: #FFF3E0; border-left: 4px solid #E65100;
     padding: 12px 16px; border-radius: 8px; margin: 8px 0;
 }
+.validation-warning {
+    background: #FFF8E1; border-left: 4px solid #F9A825;
+    padding: 12px 16px; border-radius: 8px; margin: 8px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -115,84 +119,105 @@ def preprocess_image(pil_img):
     return np.expand_dims(arr, axis=0)
 
 def detect_face_skin(pil_img):
-    """
-    Deteksi wajah dan ekstrak area kulit (dahi, pipi, dagu) menggunakan Haar Cascade
-    dengan pendekatan yang lebih presisi.
-    """
+    """Deteksi wajah dan ekstrak area kulit."""
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     h, w = cv_img.shape[:2]
     
-    # Deteksi wajah dengan Haar Cascade
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
     
     if len(faces) == 0:
         return None, False
     
-    # Ambil wajah terbesar
     areas = [w * h for (x, y, w, h) in faces]
     largest_idx = np.argmax(areas)
     x, y, w, h = faces[largest_idx]
     
-    # Buat mask untuk area wajah
-    mask = np.zeros((h, w), dtype=np.uint8)
-    
-    # Crop area wajah dengan margin
     margin_x = int(w * 0.15)
     margin_y = int(h * 0.15)
     
-    # Koordinat crop dengan margin
     x1 = max(0, x - margin_x)
     y1 = max(0, y - margin_y)
     x2 = min(cv_img.shape[1], x + w + margin_x)
     y2 = min(cv_img.shape[0], y + h + margin_y)
     
-    # Crop gambar
     cropped = cv_img[y1:y2, x1:x2]
-    
-    # Konversi ke PIL
     skin_region = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
     
-    # Deteksi area kulit lebih spesifik (dahi, pipi, dagu)
-    # Menggunakan segmentasi warna kulit sederhana dalam area wajah
-    h_crop, w_crop = cropped.shape[:2]
-    
-    # Konversi ke YCrCb untuk deteksi kulit
+    # Deteksi kulit dengan YCrCb
     skin_crop = cv2.cvtColor(cropped, cv2.COLOR_BGR2YCrCb)
-    
-    # Range warna kulit dalam YCrCb
     lower_skin = np.array([0, 133, 77], dtype=np.uint8)
     upper_skin = np.array([255, 173, 127], dtype=np.uint8)
-    
-    # Mask kulit
     skin_mask = cv2.inRange(skin_crop, lower_skin, upper_skin)
     
-    # Gabungkan dengan mask wajah
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
     skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
     
-    # Aplikasikan mask ke cropped
-    masked = cv2.bitwise_and(cropped, cropped, mask=skin_mask)
+    if np.sum(skin_mask) > 1000:
+        masked = cv2.bitwise_and(cropped, cropped, mask=skin_mask)
+        return Image.fromarray(cv2.cvtColor(masked, cv2.COLOR_BGR2RGB)), True
     
-    # Jika hasil masking terlalu sedikit, gunakan crop biasa
-    if np.sum(skin_mask) < 1000:
-        return skin_region, True
-    
-    skin_region_masked = Image.fromarray(cv2.cvtColor(masked, cv2.COLOR_BGR2RGB))
-    return skin_region_masked, True
+    return skin_region, True
 
 def check_quality(pil_img):
-    """Cek kualitas gambar (pencahayaan)."""
-    gray = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
+    """Cek kualitas gambar dengan threshold yang lebih fleksibel."""
+    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    
+    # Brightness
     brightness = float(gray.mean())
     
-    if brightness < 80:
-        return "warn", f"Terlalu gelap (brightness {brightness:.0f})"
-    elif brightness > 200:
-        return "warn", f"Terlalu terang (brightness {brightness:.0f})"
-    return "ok", f"Pencahayaan baik (brightness {brightness:.0f})"
+    # Contrast (standard deviation)
+    contrast = float(gray.std())
+    
+    # Histogram analysis untuk deteksi underexposure/overexposure
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+    hist = hist / hist.sum()
+    
+    # Persentase pixel yang sangat gelap (<30) dan sangat terang (>225)
+    dark_pixels = np.sum(hist[:30])
+    bright_pixels = np.sum(hist[225:])
+    
+    # Kategori kualitas
+    quality_status = "ok"
+    quality_msgs = []
+    
+    # Cek brightness dengan threshold yang lebih longgar
+    if brightness < 50:
+        quality_status = "warn"
+        quality_msgs.append(f"Cahaya terlalu redup ({brightness:.0f})")
+    elif brightness < 80:
+        quality_status = "warning"
+        quality_msgs.append(f"Cahaya agak redup ({brightness:.0f}) - masih bisa diproses")
+    elif brightness > 220:
+        quality_status = "warn"
+        quality_msgs.append(f"Cahaya terlalu terang ({brightness:.0f})")
+    elif brightness > 190:
+        quality_status = "warning"
+        quality_msgs.append(f"Cahaya agak terang ({brightness:.0f}) - masih bisa diproses")
+    else:
+        quality_msgs.append(f"Pencahayaan baik ({brightness:.0f})")
+    
+    # Cek kontras
+    if contrast < 30:
+        quality_status = "warning"
+        quality_msgs.append("Kontras rendah - wajah mungkin kurang jelas")
+    
+    # Cek over/under exposure
+    if dark_pixels > 0.3:
+        quality_status = "warning"
+        quality_msgs.append("Banyak area gelap - periksa pencahayaan")
+    elif bright_pixels > 0.3:
+        quality_status = "warning"
+        quality_msgs.append("Banyak area terang - hindari silau")
+    
+    # Jika brightness di range 60-210 dan contrast cukup, proses tetap jalan
+    if 60 <= brightness <= 210 and contrast > 20:
+        quality_status = "ok"
+    
+    return quality_status, " | ".join(quality_msgs)
 
 def draw_face_detection(pil_img):
     """Gambar bounding box wajah pada gambar."""
@@ -204,11 +229,10 @@ def draw_face_detection(pil_img):
     
     for (x, y, w, h) in faces:
         cv2.rectangle(cv_img, (x, y), (x+w, y+h), (233, 30, 99), 3)
-        # Gambar area dahi, pipi, dagu
-        cv2.rectangle(cv_img, (x+int(w*0.2), y+int(h*0.1)), (x+int(w*0.8), y+int(h*0.3)), (0, 200, 100), 2)  # dahi
-        cv2.rectangle(cv_img, (x+int(w*0.05), y+int(h*0.3)), (x+int(w*0.35), y+int(h*0.7)), (0, 200, 100), 2)  # pipi kiri
-        cv2.rectangle(cv_img, (x+int(w*0.65), y+int(h*0.3)), (x+int(w*0.95), y+int(h*0.7)), (0, 200, 100), 2)  # pipi kanan
-        cv2.rectangle(cv_img, (x+int(w*0.25), y+int(h*0.7)), (x+int(w*0.75), y+int(h*0.9)), (0, 200, 100), 2)  # dagu
+        cv2.rectangle(cv_img, (x+int(w*0.2), y+int(h*0.1)), (x+int(w*0.8), y+int(h*0.3)), (0, 200, 100), 2)
+        cv2.rectangle(cv_img, (x+int(w*0.05), y+int(h*0.3)), (x+int(w*0.35), y+int(h*0.7)), (0, 200, 100), 2)
+        cv2.rectangle(cv_img, (x+int(w*0.65), y+int(h*0.3)), (x+int(w*0.95), y+int(h*0.7)), (0, 200, 100), 2)
+        cv2.rectangle(cv_img, (x+int(w*0.25), y+int(h*0.7)), (x+int(w*0.75), y+int(h*0.9)), (0, 200, 100), 2)
     
     return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
 
@@ -235,7 +259,7 @@ with st.sidebar:
 if page == "Upload Image":
     st.markdown("# Temukan Shade-mu")
     st.markdown("Upload foto wajah atau ambil foto langsung menggunakan kamera.")
-    st.info("💡 Pastikan wajah terlihat jelas dan pencahayaan cukup.")
+    st.info("💡 Gunakan cahaya natural atau flash. Sistem tetap bisa memproses meskipun cahaya tidak sempurna.")
 
     if model is None:
         st.error("Model tidak ditemukan. Pastikan `skin_tone_model.h5` ada.")
@@ -273,11 +297,18 @@ if page == "Upload Image":
                     """, unsafe_allow_html=True)
                 else:
                     status, msg = check_quality(skin_region)
-                    is_valid = (status == "ok")
                     
-                    st.markdown(f'<div class="validation-{"pass" if is_valid else "fail"}"><strong>{"✅" if is_valid else "⚠️"}</strong> {msg}</div>', unsafe_allow_html=True)
+                    if status == "ok":
+                        st.markdown(f'<div class="validation-pass"><strong>✅</strong> {msg}</div>', unsafe_allow_html=True)
+                    elif status == "warning":
+                        st.markdown(f'<div class="validation-warning"><strong>⚠️</strong> {msg}</div>', unsafe_allow_html=True)
+                    else:
+                        st.markdown(f'<div class="validation-fail"><strong>❌</strong> {msg}</div>', unsafe_allow_html=True)
                     
-                    if is_valid and skin_region is not None:
+                    # Proses tetap jalan meskipun warning, hanya fail jika status "warn"
+                    can_process = (status != "warn")
+                    
+                    if can_process and skin_region is not None:
                         st.markdown("---")
                         with st.spinner("🔄 Menganalisis kulit..."):
                             probs = model.predict(preprocess_image(skin_region), verbose=0)[0]
@@ -298,6 +329,28 @@ if page == "Upload Image":
                         </div>
                         """, unsafe_allow_html=True)
                         st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
+                    elif skin_region is not None and status == "warn":
+                        st.warning("⚠️ Kualitas gambar kurang optimal. Namun Anda tetap bisa melanjutkan dengan mengklik tombol di bawah.")
+                        if st.button("🔄 Proses tetap"):
+                            with st.spinner("🔄 Menganalisis kulit..."):
+                                probs = model.predict(preprocess_image(skin_region), verbose=0)[0]
+                                idx = int(np.argmax(probs))
+                                label = CLASS_NAMES[idx]
+                                conf = float(probs[idx]) * 100
+                            
+                            st.session_state.prediction = label
+                            st.session_state.probabilities = probs
+                            
+                            st.markdown(f"""
+                            <div class="result-card">
+                                <h2>✨ {label.title()}</h2>
+                                <p style="color:#7D4455;">Skin Tone terdeteksi</p>
+                                <hr style="border-color:#F0A0B8;margin:12px 0;">
+                                <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{conf:.1f}%</p>
+                                <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
 
     with tab2:
         st.markdown("#### 📷 Ambil Foto dengan Kamera")
@@ -330,11 +383,17 @@ if page == "Upload Image":
                     """, unsafe_allow_html=True)
                 else:
                     status, msg = check_quality(skin_region)
-                    is_valid = (status == "ok")
                     
-                    st.markdown(f'<div class="validation-{"pass" if is_valid else "fail"}"><strong>{"✅" if is_valid else "⚠️"}</strong> {msg}</div>', unsafe_allow_html=True)
+                    if status == "ok":
+                        st.markdown(f'<div class="validation-pass"><strong>✅</strong> {msg}</div>', unsafe_allow_html=True)
+                    elif status == "warning":
+                        st.markdown(f'<div class="validation-warning"><strong>⚠️</strong> {msg}</div>', unsafe_allow_html=True)
+                    else:
+                        st.markdown(f'<div class="validation-fail"><strong>❌</strong> {msg}</div>', unsafe_allow_html=True)
                     
-                    if is_valid and skin_region is not None:
+                    can_process = (status != "warn")
+                    
+                    if can_process and skin_region is not None:
                         st.markdown("---")
                         with st.spinner("🔄 Menganalisis kulit..."):
                             probs = model.predict(preprocess_image(skin_region), verbose=0)[0]
@@ -355,6 +414,28 @@ if page == "Upload Image":
                         </div>
                         """, unsafe_allow_html=True)
                         st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
+                    elif skin_region is not None and status == "warn":
+                        st.warning("⚠️ Kualitas gambar kurang optimal. Namun Anda tetap bisa melanjutkan dengan mengklik tombol di bawah.")
+                        if st.button("🔄 Proses tetap"):
+                            with st.spinner("🔄 Menganalisis kulit..."):
+                                probs = model.predict(preprocess_image(skin_region), verbose=0)[0]
+                                idx = int(np.argmax(probs))
+                                label = CLASS_NAMES[idx]
+                                conf = float(probs[idx]) * 100
+                            
+                            st.session_state.prediction = label
+                            st.session_state.probabilities = probs
+                            
+                            st.markdown(f"""
+                            <div class="result-card">
+                                <h2>✨ {label.title()}</h2>
+                                <p style="color:#7D4455;">Skin Tone terdeteksi</p>
+                                <hr style="border-color:#F0A0B8;margin:12px 0;">
+                                <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{conf:.1f}%</p>
+                                <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
 
 # ═══════════════════════════════════════════════════════════════
 # PAGE: MODEL INSIGHT
