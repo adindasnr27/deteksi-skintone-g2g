@@ -166,25 +166,17 @@ def check_quality(pil_img):
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     
-    # Brightness
     brightness = float(gray.mean())
-    
-    # Contrast (standard deviation)
     contrast = float(gray.std())
     
-    # Histogram analysis untuk deteksi underexposure/overexposure
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
     hist = hist / hist.sum()
-    
-    # Persentase pixel yang sangat gelap (<30) dan sangat terang (>225)
     dark_pixels = np.sum(hist[:30])
     bright_pixels = np.sum(hist[225:])
     
-    # Kategori kualitas
     quality_status = "ok"
     quality_msgs = []
     
-    # Cek brightness dengan threshold yang lebih longgar
     if brightness < 50:
         quality_status = "warn"
         quality_msgs.append(f"Cahaya terlalu redup ({brightness:.0f})")
@@ -200,12 +192,10 @@ def check_quality(pil_img):
     else:
         quality_msgs.append(f"Pencahayaan baik ({brightness:.0f})")
     
-    # Cek kontras
     if contrast < 30:
         quality_status = "warning"
         quality_msgs.append("Kontras rendah - wajah mungkin kurang jelas")
     
-    # Cek over/under exposure
     if dark_pixels > 0.3:
         quality_status = "warning"
         quality_msgs.append("Banyak area gelap - periksa pencahayaan")
@@ -213,7 +203,6 @@ def check_quality(pil_img):
         quality_status = "warning"
         quality_msgs.append("Banyak area terang - hindari silau")
     
-    # Jika brightness di range 60-210 dan contrast cukup, proses tetap jalan
     if 60 <= brightness <= 210 and contrast > 20:
         quality_status = "ok"
     
@@ -305,7 +294,6 @@ if page == "Upload Image":
                     else:
                         st.markdown(f'<div class="validation-fail"><strong>❌</strong> {msg}</div>', unsafe_allow_html=True)
                     
-                    # Proses tetap jalan meskipun warning, hanya fail jika status "warn"
                     can_process = (status != "warn")
                     
                     if can_process and skin_region is not None:
@@ -461,7 +449,15 @@ elif page == "Model Insight":
     ax.set_facecolor("#FFF8FA")
     fig.patch.set_facecolor("#FFF8FA")
     ax.spines[["top","right"]].set_visible(False)
-    ax.legend([mpatches.Patch(color="#E8638C", label="Predicted"), mpatches.Patch(color="#F9C6D0", label="Other")])
+    
+    # Legend yang benar
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#E8638C", label="Predicted"),
+        Patch(facecolor="#F9C6D0", label="Other")
+    ]
+    ax.legend(handles=legend_elements, loc='lower right')
+    
     st.pyplot(fig)
     plt.close()
     
