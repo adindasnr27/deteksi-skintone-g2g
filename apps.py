@@ -794,9 +794,19 @@ elif page == "Beauty Recommendation":
     cols = st.columns(6)
     for col, (code, name, color) in zip(cols, shades):
         with col:
-            st.markdown(f"""
-            <div style="text-align:center;">
-                <div style="width:52px;height:52px;border-radius:50%;background:{color};
-                            margin:0 auto 6px;border:2px solid #F0A0B8;
-                            box-shadow:0 2px 8px rgba(0,0,0,0.12);"></div>
-                <p
+        st.markdown(f"""
+<div style="text-align:center;">
+    <div style="
+        width:52px;
+        height:52px;
+        border-radius:50%;
+        background:{color};
+        margin:0 auto 6px;
+        border:2px solid #F0A0B8;
+        box-shadow:0 2px 8px rgba(0,0,0,0.12);
+    "></div>
+
+    <p><strong>{code}</strong></p>
+    <p>{name}</p>
+</div>
+""", unsafe_allow_html=True)
