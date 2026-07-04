@@ -142,37 +142,34 @@ def load_model():
     return tf.keras.models.load_model(MODEL_PATH)
 
 def preprocess_image(pil_img):
-    """Preprocessing yang konsisten dengan model training."""
-    # Resize ke 224x224
     img = pil_img.convert("RGB").resize(IMG_SIZE)
-    
-    # Konversi ke array dan normalisasi
-    arr = np.array(img, dtype=np.float32)
-    
-    # Normalisasi ke [0,1] - sesuaikan dengan cara training model Anda
-    # Jika model dilatih dengan normalisasi [0,1], gunakan ini
-    arr = arr / 255.0
-    
-    # Jika model dilatih dengan ImageNet normalization, gunakan ini:
-    # arr = (arr / 255.0 - 0.5) * 2  # atau menggunakan mean/std ImageNet
-    
+    arr = np.array(img, dtype=np.float32) / 255.0
     return np.expand_dims(arr, axis=0)
 
 def detect_face_skin(pil_img):
-    """Deteksi wajah dan ekstrak area kulit dengan lebih presisi."""
+    """Deteksi wajah dengan parameter yang lebih fleksibel."""
     cascade = get_face_cascade()
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     h, w = cv_img.shape[:2]
     
-    if cascade is not None:
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
-    else:
-        faces = []
+    faces = []
     
+    if cascade is not None:
+        # Coba dengan parameter default
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        
+        # Jika tidak ada wajah, coba dengan parameter lebih longgar
+        if len(faces) == 0:
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(30, 30))
+        
+        # Jika masih tidak ada, coba dengan minNeighbors lebih rendah
+        if len(faces) == 0:
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=2, minSize=(30, 30))
+    
+    # Jika tetap tidak ada wajah, gunakan crop tengah
     if len(faces) == 0:
-        # Fallback: crop area tengah
-        crop_size = min(h, w) // 2
+        crop_size = int(min(h, w) * 0.6)
         x1 = (w - crop_size) // 2
         y1 = (h - crop_size) // 2
         x2 = x1 + crop_size
@@ -185,9 +182,9 @@ def detect_face_skin(pil_img):
     largest_idx = np.argmax(areas)
     x, y, w, h = faces[largest_idx]
     
-    # Crop area wajah dengan margin yang lebih presisi
-    margin_x = int(w * 0.1)
-    margin_y = int(h * 0.1)
+    # Crop area wajah dengan margin yang lebih besar
+    margin_x = int(w * 0.2)
+    margin_y = int(h * 0.2)
     
     x1 = max(0, x - margin_x)
     y1 = max(0, y - margin_y)
@@ -195,38 +192,12 @@ def detect_face_skin(pil_img):
     y2 = min(cv_img.shape[0], y + h + margin_y)
     
     cropped = cv_img[y1:y2, x1:x2]
+    skin_region = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
     
-    # Deteksi kulit dengan YCrCb untuk mask yang lebih presisi
-    try:
-        skin_crop = cv2.cvtColor(cropped, cv2.COLOR_BGR2YCrCb)
-        # Range warna kulit yang lebih luas
-        lower_skin = np.array([0, 130, 75], dtype=np.uint8)
-        upper_skin = np.array([255, 175, 130], dtype=np.uint8)
-        skin_mask = cv2.inRange(skin_crop, lower_skin, upper_skin)
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
-        
-        # Jika mask memiliki area yang cukup, gunakan
-        if np.sum(skin_mask) > 5000:
-            masked = cv2.bitwise_and(cropped, cropped, mask=skin_mask)
-            # Crop lagi ke area non-hitam
-            coords = cv2.findNonZero(skin_mask)
-            if coords is not None:
-                x_coords = coords[:,0,0]
-                y_coords = coords[:,0,1]
-                x_min, x_max = np.min(x_coords), np.max(x_coords)
-                y_min, y_max = np.min(y_coords), np.max(y_coords)
-                masked = masked[y_min:y_max, x_min:x_max]
-            return Image.fromarray(cv2.cvtColor(masked, cv2.COLOR_BGR2RGB)), True
-    except:
-        pass
-    
-    return Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)), True
+    return skin_region, True
 
 def check_quality(pil_img):
-    """Cek kualitas gambar dengan threshold yang lebih fleksibel."""
+    """Cek kualitas gambar."""
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     
@@ -268,7 +239,9 @@ def draw_face_detection(pil_img):
     
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+    
+    # Coba dengan parameter yang lebih longgar untuk visualisasi
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
     
     for (x, y, w, h) in faces:
         cv2.rectangle(cv_img, (x, y), (x+w, y+h), (233, 30, 99), 3)
@@ -287,7 +260,6 @@ def predict_with_confidence(skin_region):
     confidence = float(probs[idx]) * 100
     label = CLASS_NAMES[idx]
     
-    # Jika confidence rendah, berikan warning
     if confidence < 60:
         st.warning(f"⚠️ Confidence rendah ({confidence:.1f}%). Hasil mungkin kurang akurat.")
     
@@ -348,45 +320,45 @@ if page == "Upload Image":
                 if not st.session_state.face_detected:
                     st.markdown("""
                     <div class="validation-fail">
-                        <strong>⚠️ Wajah tidak terdeteksi</strong><br>
-                        Pastikan wajah terlihat jelas dan menghadap kamera.
+                        <strong>⚠️ Wajah tidak terdeteksi secara optimal</strong><br>
+                        Sistem akan tetap memproses menggunakan area tengah gambar.
                     </div>
                     """, unsafe_allow_html=True)
+                
+                status, msg = check_quality(skin_region)
+                
+                if status == "ok":
+                    st.markdown(f'<div class="validation-pass"><strong>✅</strong> {msg}</div>', unsafe_allow_html=True)
+                elif status == "warning":
+                    st.markdown(f'<div class="validation-warning"><strong>⚠️</strong> {msg}</div>', unsafe_allow_html=True)
                 else:
-                    status, msg = check_quality(skin_region)
+                    st.markdown(f'<div class="validation-fail"><strong>❌</strong> {msg}</div>', unsafe_allow_html=True)
+                
+                can_process = (status != "warn")
+                
+                if can_process and skin_region is not None:
+                    st.markdown("---")
+                    with st.spinner("🔄 Menganalisis kulit..."):
+                        label, confidence, probs = predict_with_confidence(skin_region)
                     
-                    if status == "ok":
-                        st.markdown(f'<div class="validation-pass"><strong>✅</strong> {msg}</div>', unsafe_allow_html=True)
-                    elif status == "warning":
-                        st.markdown(f'<div class="validation-warning"><strong>⚠️</strong> {msg}</div>', unsafe_allow_html=True)
-                    else:
-                        st.markdown(f'<div class="validation-fail"><strong>❌</strong> {msg}</div>', unsafe_allow_html=True)
+                    st.session_state.prediction = label
+                    st.session_state.probabilities = probs
                     
-                    can_process = (status != "warn")
-                    
-                    if can_process and skin_region is not None:
-                        st.markdown("---")
-                        with st.spinner("🔄 Menganalisis kulit..."):
-                            label, confidence, probs = predict_with_confidence(skin_region)
-                        
-                        st.session_state.prediction = label
-                        st.session_state.probabilities = probs
-                        
-                        st.markdown(f"""
-                        <div class="result-card">
-                            <h2>✨ {label.title()}</h2>
-                            <p style="color:#7D4455;">Skin Tone terdeteksi</p>
-                            <hr style="border-color:#F0A0B8;margin:12px 0;">
-                            <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{confidence:.1f}%</p>
-                            <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
-                            <p style="font-size:0.8rem;color:#7D4455;margin-top:8px;">
-                                {CLASS_NAMES[0].title()}: {probs[0]*100:.1f}% | 
-                                {CLASS_NAMES[1].title()}: {probs[1]*100:.1f}% | 
-                                {CLASS_NAMES[2].title()}: {probs[2]*100:.1f}%
-                            </p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                        st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
+                    st.markdown(f"""
+                    <div class="result-card">
+                        <h2>✨ {label.title()}</h2>
+                        <p style="color:#7D4455;">Skin Tone terdeteksi</p>
+                        <hr style="border-color:#F0A0B8;margin:12px 0;">
+                        <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{confidence:.1f}%</p>
+                        <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
+                        <p style="font-size:0.8rem;color:#7D4455;margin-top:8px;">
+                            Dark: {probs[0]*100:.1f}% | 
+                            Fair: {probs[1]*100:.1f}% | 
+                            Light: {probs[2]*100:.1f}%
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
 
     with tab2:
         st.markdown("#### 📷 Ambil Foto dengan Kamera")
@@ -413,45 +385,45 @@ if page == "Upload Image":
                 if not st.session_state.face_detected:
                     st.markdown("""
                     <div class="validation-fail">
-                        <strong>⚠️ Wajah tidak terdeteksi</strong><br>
-                        Posisikan wajah di tengah frame.
+                        <strong>⚠️ Wajah tidak terdeteksi secara optimal</strong><br>
+                        Sistem akan tetap memproses menggunakan area tengah gambar.
                     </div>
                     """, unsafe_allow_html=True)
+                
+                status, msg = check_quality(skin_region)
+                
+                if status == "ok":
+                    st.markdown(f'<div class="validation-pass"><strong>✅</strong> {msg}</div>', unsafe_allow_html=True)
+                elif status == "warning":
+                    st.markdown(f'<div class="validation-warning"><strong>⚠️</strong> {msg}</div>', unsafe_allow_html=True)
                 else:
-                    status, msg = check_quality(skin_region)
+                    st.markdown(f'<div class="validation-fail"><strong>❌</strong> {msg}</div>', unsafe_allow_html=True)
+                
+                can_process = (status != "warn")
+                
+                if can_process and skin_region is not None:
+                    st.markdown("---")
+                    with st.spinner("🔄 Menganalisis kulit..."):
+                        label, confidence, probs = predict_with_confidence(skin_region)
                     
-                    if status == "ok":
-                        st.markdown(f'<div class="validation-pass"><strong>✅</strong> {msg}</div>', unsafe_allow_html=True)
-                    elif status == "warning":
-                        st.markdown(f'<div class="validation-warning"><strong>⚠️</strong> {msg}</div>', unsafe_allow_html=True)
-                    else:
-                        st.markdown(f'<div class="validation-fail"><strong>❌</strong> {msg}</div>', unsafe_allow_html=True)
+                    st.session_state.prediction = label
+                    st.session_state.probabilities = probs
                     
-                    can_process = (status != "warn")
-                    
-                    if can_process and skin_region is not None:
-                        st.markdown("---")
-                        with st.spinner("🔄 Menganalisis kulit..."):
-                            label, confidence, probs = predict_with_confidence(skin_region)
-                        
-                        st.session_state.prediction = label
-                        st.session_state.probabilities = probs
-                        
-                        st.markdown(f"""
-                        <div class="result-card">
-                            <h2>✨ {label.title()}</h2>
-                            <p style="color:#7D4455;">Skin Tone terdeteksi</p>
-                            <hr style="border-color:#F0A0B8;margin:12px 0;">
-                            <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{confidence:.1f}%</p>
-                            <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
-                            <p style="font-size:0.8rem;color:#7D4455;margin-top:8px;">
-                                {CLASS_NAMES[0].title()}: {probs[0]*100:.1f}% | 
-                                {CLASS_NAMES[1].title()}: {probs[1]*100:.1f}% | 
-                                {CLASS_NAMES[2].title()}: {probs[2]*100:.1f}%
-                            </p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                        st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
+                    st.markdown(f"""
+                    <div class="result-card">
+                        <h2>✨ {label.title()}</h2>
+                        <p style="color:#7D4455;">Skin Tone terdeteksi</p>
+                        <hr style="border-color:#F0A0B8;margin:12px 0;">
+                        <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{confidence:.1f}%</p>
+                        <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
+                        <p style="font-size:0.8rem;color:#7D4455;margin-top:8px;">
+                            Dark: {probs[0]*100:.1f}% | 
+                            Fair: {probs[1]*100:.1f}% | 
+                            Light: {probs[2]*100:.1f}%
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
 
 # ═══════════════════════════════════════════════════════════════
 # PAGE: MODEL INSIGHT
