@@ -105,6 +105,49 @@ G2G_RECOMMENDATION = {
 }
 
 # ─────────────────────────────────────────
+# LOAD CASCADE CLASSIFIER (DENGAN FALLBACK)
+# ─────────────────────────────────────────
+@st.cache_resource
+def get_face_cascade():
+    """Load Haar Cascade classifier dengan fallback."""
+    try:
+        # Cara 1: Path default OpenCV
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        if os.path.exists(cascade_path):
+            return cv2.CascadeClassifier(cascade_path)
+        
+        # Cara 2: Coba path alternatif
+        alt_paths = [
+            "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+            "/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+            "/usr/share/OpenCV/haarcascades/haarcascade_frontalface_default.xml",
+            os.path.join(os.path.dirname(cv2.__file__), "data", "haarcascade_frontalface_default.xml")
+        ]
+        
+        for path in alt_paths:
+            if os.path.exists(path):
+                return cv2.CascadeClassifier(path)
+        
+        # Cara 3: Download dari internet (Streamlit Cloud)
+        import urllib.request
+        url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
+        local_path = "/tmp/haarcascade_frontalface_default.xml"
+        
+        try:
+            urllib.request.urlretrieve(url, local_path)
+            if os.path.exists(local_path):
+                return cv2.CascadeClassifier(local_path)
+        except:
+            pass
+        
+        # Jika semua gagal, return None
+        return None
+        
+    except Exception as e:
+        st.warning(f"⚠️ Error loading face cascade: {e}")
+        return None
+
+# ─────────────────────────────────────────
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────
 @st.cache_resource
@@ -120,16 +163,44 @@ def preprocess_image(pil_img):
 
 def detect_face_skin(pil_img):
     """Deteksi wajah dan ekstrak area kulit."""
+    cascade = get_face_cascade()
+    
+    if cascade is None:
+        # Jika cascade tidak tersedia, gunakan crop tengah gambar
+        st.warning("⚠️ Face detector tidak tersedia. Menggunakan crop tengah gambar.")
+        cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        h, w = cv_img.shape[:2]
+        
+        # Crop area tengah (asumsi wajah di tengah)
+        crop_size = min(h, w)
+        x1 = (w - crop_size) // 2
+        y1 = (h - crop_size) // 2
+        x2 = x1 + crop_size
+        y2 = y1 + crop_size
+        
+        cropped = cv_img[y1:y2, x1:x2]
+        skin_region = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+        return skin_region, True
+    
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    h, w = cv_img.shape[:2]
     
-    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
     
     if len(faces) == 0:
-        return None, False
+        # Jika tidak ada wajah terdeteksi, crop tengah gambar
+        h, w = cv_img.shape[:2]
+        crop_size = min(h, w) // 2
+        x1 = (w - crop_size) // 2
+        y1 = (h - crop_size) // 2
+        x2 = x1 + crop_size
+        y2 = y1 + crop_size
+        
+        cropped = cv_img[y1:y2, x1:x2]
+        skin_region = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+        return skin_region, False
     
+    # Ambil wajah terbesar
     areas = [w * h for (x, y, w, h) in faces]
     largest_idx = np.argmax(areas)
     x, y, w, h = faces[largest_idx]
@@ -145,19 +216,22 @@ def detect_face_skin(pil_img):
     cropped = cv_img[y1:y2, x1:x2]
     skin_region = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
     
-    # Deteksi kulit dengan YCrCb
-    skin_crop = cv2.cvtColor(cropped, cv2.COLOR_BGR2YCrCb)
-    lower_skin = np.array([0, 133, 77], dtype=np.uint8)
-    upper_skin = np.array([255, 173, 127], dtype=np.uint8)
-    skin_mask = cv2.inRange(skin_crop, lower_skin, upper_skin)
-    
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
-    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
-    
-    if np.sum(skin_mask) > 1000:
-        masked = cv2.bitwise_and(cropped, cropped, mask=skin_mask)
-        return Image.fromarray(cv2.cvtColor(masked, cv2.COLOR_BGR2RGB)), True
+    try:
+        # Deteksi kulit dengan YCrCb (optional)
+        skin_crop = cv2.cvtColor(cropped, cv2.COLOR_BGR2YCrCb)
+        lower_skin = np.array([0, 133, 77], dtype=np.uint8)
+        upper_skin = np.array([255, 173, 127], dtype=np.uint8)
+        skin_mask = cv2.inRange(skin_crop, lower_skin, upper_skin)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
+        
+        if np.sum(skin_mask) > 1000:
+            masked = cv2.bitwise_and(cropped, cropped, mask=skin_mask)
+            return Image.fromarray(cv2.cvtColor(masked, cv2.COLOR_BGR2RGB)), True
+    except:
+        pass
     
     return skin_region, True
 
@@ -210,10 +284,14 @@ def check_quality(pil_img):
 
 def draw_face_detection(pil_img):
     """Gambar bounding box wajah pada gambar."""
+    cascade = get_face_cascade()
+    
+    if cascade is None:
+        return pil_img
+    
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     
-    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
     
     for (x, y, w, h) in faces:
@@ -317,28 +395,6 @@ if page == "Upload Image":
                         </div>
                         """, unsafe_allow_html=True)
                         st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
-                    elif skin_region is not None and status == "warn":
-                        st.warning("⚠️ Kualitas gambar kurang optimal. Namun Anda tetap bisa melanjutkan dengan mengklik tombol di bawah.")
-                        if st.button("🔄 Proses tetap"):
-                            with st.spinner("🔄 Menganalisis kulit..."):
-                                probs = model.predict(preprocess_image(skin_region), verbose=0)[0]
-                                idx = int(np.argmax(probs))
-                                label = CLASS_NAMES[idx]
-                                conf = float(probs[idx]) * 100
-                            
-                            st.session_state.prediction = label
-                            st.session_state.probabilities = probs
-                            
-                            st.markdown(f"""
-                            <div class="result-card">
-                                <h2>✨ {label.title()}</h2>
-                                <p style="color:#7D4455;">Skin Tone terdeteksi</p>
-                                <hr style="border-color:#F0A0B8;margin:12px 0;">
-                                <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{conf:.1f}%</p>
-                                <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
 
     with tab2:
         st.markdown("#### 📷 Ambil Foto dengan Kamera")
@@ -402,28 +458,6 @@ if page == "Upload Image":
                         </div>
                         """, unsafe_allow_html=True)
                         st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
-                    elif skin_region is not None and status == "warn":
-                        st.warning("⚠️ Kualitas gambar kurang optimal. Namun Anda tetap bisa melanjutkan dengan mengklik tombol di bawah.")
-                        if st.button("🔄 Proses tetap"):
-                            with st.spinner("🔄 Menganalisis kulit..."):
-                                probs = model.predict(preprocess_image(skin_region), verbose=0)[0]
-                                idx = int(np.argmax(probs))
-                                label = CLASS_NAMES[idx]
-                                conf = float(probs[idx]) * 100
-                            
-                            st.session_state.prediction = label
-                            st.session_state.probabilities = probs
-                            
-                            st.markdown(f"""
-                            <div class="result-card">
-                                <h2>✨ {label.title()}</h2>
-                                <p style="color:#7D4455;">Skin Tone terdeteksi</p>
-                                <hr style="border-color:#F0A0B8;margin:12px 0;">
-                                <p style="font-size:1.6rem;font-weight:700;color:#C2185B;">{conf:.1f}%</p>
-                                <p style="font-size:0.85rem;color:#7D4455;">Confidence Score</p>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            st.success("💖 Lihat **Beauty Recommendation** di sidebar!")
 
 # ═══════════════════════════════════════════════════════════════
 # PAGE: MODEL INSIGHT
@@ -450,7 +484,6 @@ elif page == "Model Insight":
     fig.patch.set_facecolor("#FFF8FA")
     ax.spines[["top","right"]].set_visible(False)
     
-    # Legend yang benar
     from matplotlib.patches import Patch
     legend_elements = [
         Patch(facecolor="#E8638C", label="Predicted"),
